@@ -1180,6 +1180,7 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
       streamError: boolean;
       ttfbTimedOut: boolean;
       idleTimedOut: boolean;
+      fetchFailed: boolean;
       promptTokens: number;
       completionTokens: number;
       totalTokens: number | undefined;
@@ -1259,6 +1260,7 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
       // before the first token is seen.
       let ttfbTimedOut = false;
       let idleTimedOut = false;
+      let fetchFailed = false;
       let ttfbTimer: ReturnType<typeof setTimeout> | undefined;
       const ttfbTimeoutMs = adaptiveTtfbTimeoutMs(
         network.ttfbTimeoutMs ?? DEFAULT_TTFB_TIMEOUT_MS,
@@ -1536,6 +1538,7 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
               streamError: true,
               ttfbTimedOut: false,
               idleTimedOut: false,
+              fetchFailed: true,
               promptTokens,
               completionTokens,
               totalTokens,
@@ -1561,6 +1564,7 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
             streamError: true,
             ttfbTimedOut: false,
             idleTimedOut: false,
+            fetchFailed: true,
             promptTokens,
             completionTokens,
             totalTokens,
@@ -1874,6 +1878,7 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
         streamError,
         ttfbTimedOut,
         idleTimedOut,
+        fetchFailed,
         promptTokens,
         completionTokens,
         totalTokens,
@@ -1936,18 +1941,24 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
       lastResult = result;
 
       // Success or non-retryable error: stop.
-      // TTFB timeout and stream idle timeout ARE retryable — the provider
-      // stalled, so we try the next provider in the failover chain.
-      if (result.hasVisibleContent || (result.streamError && !result.ttfbTimedOut && !result.idleTimedOut)) {
+      // TTFB timeout, stream idle timeout, and fetch failure ARE retryable —
+      // the provider stalled or was unreachable, so we try the next provider
+      // in the failover chain. A mid-stream error (not fetch, not timeout) is
+      // non-retryable: the provider started responding then broke, so the
+      // client should get the error rather than burning more providers.
+      if (result.hasVisibleContent || (result.streamError && !result.ttfbTimedOut && !result.idleTimedOut && !result.fetchFailed)) {
         break;
       }
 
-      // TTFB timeout, idle timeout, or empty completion: try the next provider.
+      // TTFB timeout, idle timeout, fetch failure, or empty completion: try
+      // the next provider.
       const failoverReason = result.ttfbTimedOut
         ? "ttfb_timeout"
         : result.idleTimedOut
           ? "idle_timeout"
-          : "empty_completion";
+          : result.fetchFailed
+            ? "fetch_failed"
+            : "empty_completion";
       recordAttempt(providerName, model, failoverReason as AttemptOutcome, emptyAttemptStart, failoverReason);
 
       // Find the next provider to try. On the first failover, switch to
