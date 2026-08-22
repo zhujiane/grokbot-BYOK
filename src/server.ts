@@ -1168,7 +1168,6 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
       }
     }
 
-    const MAX_EMPTY_COMPLETION_RETRIES = 2;
     const EMPTY_COMPLETION_BASE_DELAY_MS = 500;
     const POST_FINISH_GRACE_MS = 2000;
     const MAX_TOOL_CALLS_PER_RESPONSE = 20;
@@ -1921,10 +1920,18 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
     const remainingProviders = failoverChain.filter(
       (p) => !triedProviderNames.has(p.name),
     );
+    // Try the connected provider plus every remaining provider in the chain.
+    // Using the chain size as the attempt cap means we don't give up early
+    // when providers are overloaded and more fallbacks are available, while
+    // still capping at a reasonable number to avoid unbounded attempts.
+    const maxFailoverAttempts = Math.max(
+      0,
+      remainingProviders.length,
+    );
 
     for (
       let emptyAttempt = 0;
-      emptyAttempt <= MAX_EMPTY_COMPLETION_RETRIES;
+      emptyAttempt <= maxFailoverAttempts;
       emptyAttempt++
     ) {
       // If the client disconnected (closed the response connection before
@@ -1942,7 +1949,13 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
         break;
       }
       if (emptyAttempt > 0) {
-        await sleep(EMPTY_COMPLETION_BASE_DELAY_MS * 2 ** (emptyAttempt - 1));
+        // Short fixed delay between provider failovers. Each provider is
+        // independent, so exponential backoff for the same provider doesn't
+        // apply here. A 500ms breather is enough to avoid hammering the
+        // next fallback right after the previous one, without making the
+        // user wait through long backoffs when multiple providers are
+        // overloaded at once.
+        await sleep(EMPTY_COMPLETION_BASE_DELAY_MS);
       }
       const emptyAttemptStart = Date.now();
       const result = await attemptStream(
@@ -1977,7 +1990,7 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
       const nextProvider = remainingProviders.shift();
       if (!nextProvider) {
         // No more providers to try — log and stop.
-        if (emptyAttempt < MAX_EMPTY_COMPLETION_RETRIES) {
+        if (remainingProviders.length === 0) {
           logger.info(`${failoverReason}, no more providers to try`, {
             model,
             provider: providerName,
