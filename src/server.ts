@@ -1596,6 +1596,17 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
         // timeout, abort the stream so the caller can failover to the
         // next provider instead of waiting indefinitely.
         if (ttfbTimeoutMs > 0 && ttfbMs === undefined) {
+          // The adaptive TTFB timeout is meant to cover the full prefill
+          // (including connection time). ttfbMs is measured from
+          // streamStartMs, so the timer must fire when ttfbMs reaches
+          // ttfbTimeoutMs — not ttfbTimeoutMs after the timer is set.
+          // Subtract the time already elapsed since streamStartMs (which
+          // includes connection time for the first attempt) so the
+          // effective timeout is exactly ttfbTimeoutMs. If the connection
+          // already exceeded the budget, remainingTimeout is 0 and the
+          // timer fires on the next tick to abort immediately.
+          const elapsedSinceStart = Date.now() - streamStartMs;
+          const remainingTimeout = Math.max(0, ttfbTimeoutMs - elapsedSinceStart);
           ttfbTimer = setTimeout(() => {
             if (streamClosed || ttfbMs !== undefined) return;
             ttfbTimedOut = true;
@@ -1607,7 +1618,7 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
               elapsed: Date.now() - requestStart,
             });
             void reader?.cancel().catch(() => { /* ignore */ });
-          }, ttfbTimeoutMs);
+          }, remainingTimeout);
         }
         // eslint-disable-next-line no-constant-condition
         while (true) {

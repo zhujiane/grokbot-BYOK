@@ -158,9 +158,9 @@ class PerformanceTracker {
     // first token to stream end), falling back to total elapsed if TTFB
     // wasn't recorded (e.g. empty completion).
     const generationMs = ttfbMs !== undefined
-      ? Math.max(1, streamDurationMs - ttfbMs)
-      : Math.max(1, streamDurationMs);
-    const reqTokensPerSec = completionTokens / (generationMs / 1000);
+      ? Math.max(100, streamDurationMs - ttfbMs)
+      : Math.max(100, streamDurationMs);
+    const reqTokensPerSec = Math.min(1000, completionTokens / (generationMs / 1000));
 
     // EWMA update: blend the new sample with the running average.
     if (p.samples === 0) {
