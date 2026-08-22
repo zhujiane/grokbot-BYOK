@@ -1213,8 +1213,23 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
         // lose those token counts.
         const extracted = extractUsage(chunk);
         if (extracted) {
-          promptTokens = extracted.promptTokens ?? promptTokens;
-          completionTokens = extracted.completionTokens ?? completionTokens;
+          // Use || for prompt/completion tokens: extractUsage always returns
+          // numbers (via safeTokenCount), so ?? never falls through. A
+          // provider that sends multiple usage chunks may omit prompt_tokens
+          // or completion_tokens in a later chunk; extractUsage defaults the
+          // missing field to 0, which would overwrite a previously correct
+          // non-zero value. || keeps the prior value when the new one is 0
+          // (i.e. not reported by this chunk). 0 prompt tokens is never
+          // valid (there is always a prompt), and a 0 in a later completion
+          // count means "not reported", not "0 completion".
+          //
+          // The optional detail fields (totalTokens, reasoningTokens,
+          // cachedTokens, cacheWriteTokens) keep ??: 0 is a valid value for
+          // them (no reasoning, no cache hit, etc.), and ?? preserves the
+          // existing behavior of including them in the usage frame as 0
+          // when the provider reports a usage block without them.
+          promptTokens = extracted.promptTokens || promptTokens;
+          completionTokens = extracted.completionTokens || completionTokens;
           totalTokens = extracted.totalTokens ?? totalTokens;
           reasoningTokens = extracted.reasoningTokens ?? reasoningTokens;
           cachedTokens = extracted.cachedTokens ?? cachedTokens;
