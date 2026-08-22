@@ -58,13 +58,14 @@ export class ToolCallAccumulator {
       if (!toolCalls) {
         continue;
       }
-      for (const tc of toolCalls) {
+      for (const [tcArrayIndex, tc] of toolCalls.entries()) {
         // Composite key: combine the choice index with the per-choice
         // tool_call index so that tool calls from different choices (n > 1)
         // sharing the same tool_call index don't collide into one entry.
         // Providers may omit these indices on malformed/legacy chunks, so
-        // fall back to 0 to avoid producing a NaN Map key.
-        const idx = (choice.index ?? 0) * 1000000 + (tc.index ?? 0);
+        // fall back to the tool call's position in the delta array — better
+        // than 0, which would collapse multiple omitted-index calls into one.
+        const idx = (choice.index ?? 0) * 1000000 + (tc.index ?? tcArrayIndex);
         const existing = this.calls.get(idx);
         // Use || (not ??) for id/name so that an explicit empty string in a
         // later delta doesn't overwrite a previously accumulated valid value.

@@ -179,25 +179,28 @@ export function extractUsage(chunk: OpenAISSEChunk): ExtractedUsage | null {
     usage.prompt_cache_miss_tokens !== undefined;
   const cacheWriteTokens =
     cacheWriteOpenRouter ?? cacheWriteDeepSeek ?? 0;
+  // DeepSeek's prompt_cache_miss_tokens are a breakdown of the prompt, not an
+  // extra token count, so they should not inflate the total-tokens formula.
+  // The cacheWriteTokens value is still reported as the cache-write detail.
   const isDeepSeekUsage =
     hasDeepSeekCacheHitAndMiss &&
     cacheWriteOpenRouter === undefined &&
     (cacheWriteDeepSeek ?? 0) > 0;
-  const cacheWrite = isDeepSeekUsage ? 0 : cacheWriteTokens;
+  const cacheWriteForTotal = isDeepSeekUsage ? 0 : cacheWriteTokens;
   const totalTokens =
     typeof reportedTotal === "number"
       ? reportedTotal
-      : Math.max(0, promptTokens - cachedTokens - cacheWrite) +
+      : Math.max(0, promptTokens - cachedTokens - cacheWriteForTotal) +
         completionTokens +
         cachedTokens +
-        cacheWrite;
+        cacheWriteForTotal;
   return {
     promptTokens: safeTokenCount(promptTokens),
     completionTokens: safeTokenCount(completionTokens),
     totalTokens: safeTokenCount(totalTokens),
     reasoningTokens: safeTokenCount(reasoningTokens),
     cachedTokens: safeTokenCount(cachedTokens),
-    cacheWriteTokens: safeTokenCount(cacheWrite),
+    cacheWriteTokens: safeTokenCount(cacheWriteTokens),
   };
 }
 

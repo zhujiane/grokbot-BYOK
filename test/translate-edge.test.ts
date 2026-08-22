@@ -10,6 +10,7 @@ import {
   makeToolCallFrame,
   makeUsageFrame,
   makeErrorFrame,
+  extractUsage,
 } from "../src/translate/response.js";
 import { ToolCallAccumulator } from "../src/translate/tools.js";
 import type {
@@ -785,5 +786,132 @@ describe("ToolCallAccumulator — edge cases", () => {
       expect(tc.toolCallPart.toolName).toBe("");
       expect(tc.toolCallPart.args).toBe("x");
     }
+  });
+
+  it("omitted tc.index in a multi-call delta falls back to the array position", () => {
+    const acc = new ToolCallAccumulator();
+    // Two tool calls in one chunk with no index field: they must not collapse.
+    acc.feed({
+      choices: [
+        {
+          index: 0,
+          delta: {
+            tool_calls: [
+              { id: "a1", function: { name: "first", arguments: "{" } },
+              { id: "a2", function: { name: "second", arguments: "{" } },
+            ],
+          },
+        },
+      ],
+    });
+    acc.feed({
+      choices: [
+        {
+          index: 0,
+          delta: {
+            tool_calls: [
+              { function: { arguments: "}" } },
+              { function: { arguments: "}" } },
+            ],
+          },
+        },
+      ],
+    });
+    expect(acc.size).toBe(2);
+    const frames = acc.flush(true);
+    expect(frames).toHaveLength(2);
+    const names = frames.map((f) =>
+      "toolCallPart" in f ? f.toolCallPart.toolName : "",
+    );
+    expect(names).toEqual(["first", "second"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// extractUsage — edge cases
+// ---------------------------------------------------------------------------
+
+describe("extractUsage", () => {
+  it("returns null when the chunk has no usage block", () => {
+    expect(extractUsage({} as OpenAISSEChunk)).toBeNull();
+  });
+
+  it("extracts basic prompt/completion/total fields", () => {
+    const result = extractUsage({
+      usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+    } as OpenAISSEChunk);
+    expect(result).toEqual({
+      promptTokens: 10,
+      completionTokens: 5,
+      totalTokens: 15,
+      reasoningTokens: 0,
+      cachedTokens: 0,
+      cacheWriteTokens: 0,
+    });
+  });
+
+  it("recomputes total tokens from the prompt/completion counts when omitted", () => {
+    const result = extractUsage({
+      usage: { prompt_tokens: 10, completion_tokens: 5 },
+    } as OpenAISSEChunk);
+    expect(result?.totalTokens).toBe(15);
+  });
+
+  it("extracts OpenRouter cache tokens", () => {
+    const result = extractUsage({
+      usage: {
+        prompt_tokens: 100,
+        completion_tokens: 20,
+        prompt_tokens_details: {
+          cached_tokens: 70,
+          cache_write_tokens: 30,
+        },
+      },
+    } as OpenAISSEChunk);
+    expect(result).toEqual({
+      promptTokens: 100,
+      completionTokens: 20,
+      totalTokens: 120,
+      reasoningTokens: 0,
+      cachedTokens: 70,
+      cacheWriteTokens: 30,
+    });
+  });
+
+  it("extracts DeepSeek cache hit/miss tokens and reports cache writes", () => {
+    const result = extractUsage({
+      usage: {
+        prompt_tokens: 100,
+        completion_tokens: 50,
+        total_tokens: 150,
+        prompt_cache_hit_tokens: 80,
+        prompt_cache_miss_tokens: 20,
+      },
+    } as OpenAISSEChunk);
+    expect(result).toEqual({
+      promptTokens: 100,
+      completionTokens: 50,
+      totalTokens: 150,
+      reasoningTokens: 0,
+      cachedTokens: 80,
+      cacheWriteTokens: 20,
+    });
+  });
+
+  it("preferentially uses OpenRouter cache_write_tokens over DeepSeek miss tokens", () => {
+    const result = extractUsage({
+      usage: {
+        prompt_tokens: 100,
+        completion_tokens: 20,
+        prompt_tokens_details: {
+          cached_tokens: 70,
+          cache_write_tokens: 30,
+        },
+        prompt_cache_hit_tokens: 0,
+        prompt_cache_miss_tokens: 20,
+      },
+    } as OpenAISSEChunk);
+    expect(result?.cachedTokens).toBe(70);
+    expect(result?.cacheWriteTokens).toBe(30);
   });
 });
