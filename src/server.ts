@@ -814,6 +814,7 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
           network: NetworkConfig;
           baseUrl: string;
           compat: ProviderCompat;
+          connectionStartMs: number;
         }
       | undefined;
     let requestErrorMessage: string | null = null;
@@ -903,6 +904,7 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
               network: provider.network,
               baseUrl: provider.baseUrl,
               compat: provider.compat,
+              connectionStartMs: attemptStart,
             };
             recordAttempt(provider.name, model, "ok", attemptStart, undefined, keyOrdinal);
             resetBreaker(consecBreaker);
@@ -1135,7 +1137,7 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
     //     closure references them by name, so reassignment here is visible
     //     inside attemptStream on the next call.
     // ---------------------------------------------------------------------
-    let { resp: firstResp, providerName, model, key, network, baseUrl, compat } =
+    let { resp: firstResp, providerName, model, key, network, baseUrl, compat, connectionStartMs } =
       connected;
     let requestTimeoutMs = adaptiveRequestTimeoutMs(
       network.requestTimeoutMs ?? config.requestTimeoutMs,
@@ -1189,13 +1191,23 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
 
     const attemptStream = async (
       existingResp: Response | undefined,
+      existingConnectionStartMs?: number,
     ): Promise<AttemptResult> => {
       // Stream-local start time: measures only this attempt's duration,
       // excluding time spent on previous providers' failed attempts and
       // the backoff sleep between retries. Used for TTFB and stream
       // duration measurements so the performance tracker gets accurate
       // per-provider latency, not inflated by prior attempt overhead.
-      const streamStartMs = Date.now();
+      //
+      // When existingResp is provided (first attempt), the fetch already
+      // completed in the connection phase. Using Date.now() here would
+      // exclude the connection/prefill time from TTFB, making providers
+      // that do prefill before sending headers (e.g. opencode-go with
+      // ttfb=0-2ms) look artificially fast. Instead, use the connection
+      // attempt start time so TTFB includes the full prefill duration.
+      // For retry attempts (no existingResp), the fetch happens inside
+      // attemptStream, so Date.now() is the correct baseline.
+      const streamStartMs = existingConnectionStartMs ?? Date.now();
       const frames: InferenceStreamResponse[] = [];
       const responseId = `chatcmpl-shim-${Date.now().toString(36)}`;
       frames.push(makeResponseInfoFrame(responseId, model));
@@ -1919,6 +1931,7 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
       const emptyAttemptStart = Date.now();
       const result = await attemptStream(
         emptyAttempt === 0 ? firstResp : undefined,
+        emptyAttempt === 0 ? connectionStartMs : undefined,
       );
       lastResult = result;
 
