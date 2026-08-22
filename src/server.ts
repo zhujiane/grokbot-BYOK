@@ -373,7 +373,9 @@ async function shadowProbe(
         sseParser.feed(text);
         for (const data of sseParser.drain()) {
           if (data === "[DONE]") {
-            success = true;
+            // Only mark success if we actually read some content.
+            // [DONE] with 0 tokens = empty response, not a successful probe.
+            if (tokenCount > 0) success = true;
             break;
           }
           try {
@@ -382,10 +384,12 @@ async function shadowProbe(
             const extracted = extractUsage(chunk);
           if (extracted?.promptTokens) promptTokens = extracted.promptTokens;
           if (extracted?.completionTokens) completionTokens = extracted.completionTokens;
-            // Check for first content token (TTFB).
+            // Check for first content token (TTFB). Tool-call deltas also
+            // count as content — without this, a tool-call-only response
+            // would never set ttfbMs (same bug as the main stream).
             for (const choice of chunk.choices ?? []) {
               const delta = choice.delta;
-              if (delta?.content || delta?.reasoning_content || delta?.reasoning || delta?.reasoning_text) {
+              if (delta?.content || delta?.reasoning_content || delta?.reasoning || delta?.reasoning_text || (delta?.tool_calls && delta.tool_calls.length > 0)) {
                 if (ttfbMs === undefined) {
                   ttfbMs = Date.now() - probeStart;
                   clearTimeout(ttfbTimer);
@@ -393,7 +397,10 @@ async function shadowProbe(
                 tokenCount++;
               }
               if (choice.finish_reason) {
-                success = true;
+                // Only mark success if we actually read some content.
+                // A finish_reason with 0 tokens means the provider returned
+                // an empty response — not a successful probe.
+                if (tokenCount > 0) success = true;
               }
             }
           } catch {
@@ -425,7 +432,10 @@ async function shadowProbe(
     }
 
     const elapsed = Date.now() - probeStart;
-    success = success || (ttfbMs !== undefined && tokenCount > 0);
+    // A probe that read 0 tokens (e.g. upstream sent [DONE] or a
+    // finish_reason with no content) is NOT successful — there's no TTFB
+    // or throughput data to record. Require at least one token read.
+    success = tokenCount > 0 && (success || ttfbMs !== undefined);
 
     logger.info("shadow probe complete", {
       requestId,
@@ -1167,6 +1177,7 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
       sawFinish: boolean;
       streamError: boolean;
       ttfbTimedOut: boolean;
+      idleTimedOut: boolean;
       promptTokens: number;
       completionTokens: number;
       totalTokens: number | undefined;
@@ -1235,6 +1246,7 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
       // idle timeout (which fires between tokens), this fires only once —
       // before the first token is seen.
       let ttfbTimedOut = false;
+      let idleTimedOut = false;
       let ttfbTimer: ReturnType<typeof setTimeout> | undefined;
       const ttfbTimeoutMs = adaptiveTtfbTimeoutMs(
         network.ttfbTimeoutMs ?? DEFAULT_TTFB_TIMEOUT_MS,
@@ -1265,6 +1277,7 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
           return;
         }
         streamError = true;
+        idleTimedOut = true;
         logger.error("stream idle timeout", {
           model,
           provider: providerName,
@@ -1510,6 +1523,7 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
               sawFinish: false,
               streamError: true,
               ttfbTimedOut: false,
+              idleTimedOut: false,
               promptTokens,
               completionTokens,
               totalTokens,
@@ -1534,6 +1548,7 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
             sawFinish: false,
             streamError: true,
             ttfbTimedOut: false,
+            idleTimedOut: false,
             promptTokens,
             completionTokens,
             totalTokens,
@@ -1587,10 +1602,22 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
           if (done) {
             break;
           }
-          streamTimeout.reset();
           const text = decoder.decode(value, { stream: true });
           sseParser.feed(text);
-          for (const data of sseParser.drain()) {
+          const drained = sseParser.drain();
+          // Only reset the idle timer when actual SSE `data:` payloads are
+          // received, not on every raw byte. Providers (e.g. OpenRouter) send
+          // periodic keepalive comments (`:keepalive\n\n`) or empty `data:\n\n`
+          // lines to hold the socket open; the SseParser drops those, so
+          // `drain()` returns nothing for them. Resetting on raw bytes would
+          // keep an otherwise-stalled stream alive indefinitely — the stream
+          // appears "active" (timer keeps resetting) but never produces
+          // content. By resetting only when real data payloads arrive, a
+          // keepalive-only stall trips the idle timeout as intended.
+          if (drained.length > 0) {
+            streamTimeout.reset();
+          }
+          for (const data of drained) {
             processData(data);
             if (streamError) break;
           }
@@ -1834,6 +1861,7 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
         sawFinish,
         streamError,
         ttfbTimedOut,
+        idleTimedOut,
         promptTokens,
         completionTokens,
         totalTokens,
@@ -1895,12 +1923,18 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
       lastResult = result;
 
       // Success or non-retryable error: stop.
-      if (result.hasVisibleContent || (result.streamError && !result.ttfbTimedOut)) {
+      // TTFB timeout and stream idle timeout ARE retryable — the provider
+      // stalled, so we try the next provider in the failover chain.
+      if (result.hasVisibleContent || (result.streamError && !result.ttfbTimedOut && !result.idleTimedOut)) {
         break;
       }
 
-      // TTFB timeout or empty completion: try the next provider if available.
-      const failoverReason = result.ttfbTimedOut ? "ttfb_timeout" : "empty_completion";
+      // TTFB timeout, idle timeout, or empty completion: try the next provider.
+      const failoverReason = result.ttfbTimedOut
+        ? "ttfb_timeout"
+        : result.idleTimedOut
+          ? "idle_timeout"
+          : "empty_completion";
       recordAttempt(providerName, model, failoverReason as AttemptOutcome, emptyAttemptStart, failoverReason);
 
       // Find the next provider to try. On the first failover, switch to

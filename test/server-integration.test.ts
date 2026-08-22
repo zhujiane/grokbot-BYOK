@@ -61,6 +61,12 @@ interface MockUpstreamOpts {
   authKeyStatus?: Record<string, number>;
   /** SSE chunks to send when an auth-key override resolves to status 200. */
   authKeySseChunks?: object[];
+  /** If set, send SSE comment keepalives (":keepalive\n\n") every N ms before
+   *  the real SSE chunks. Used to test that keepalive-only bytes don't reset
+   *  the stream idle timeout. */
+  keepaliveMs?: number;
+  /** How long to send keepalives before delivering real chunks (ms). */
+  keepaliveDurationMs?: number;
 }
 
 interface MockUpstream {
@@ -131,11 +137,30 @@ function startMockUpstream(opts: MockUpstreamOpts = {}): Promise<MockUpstream> {
             "Cache-Control": "no-cache",
             ...(opts.headers ?? {}),
           });
-          for (const chunk of sseChunks) {
-            res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+          // If keepalive is configured, send comment lines periodically
+          // before the real data. This simulates providers like OpenRouter
+          // that send ":keepalive\n\n" to hold the socket open.
+          if (opts.keepaliveMs && opts.keepaliveDurationMs) {
+            const kaStart = Date.now();
+            const kaTimer = setInterval(() => {
+              if (Date.now() - kaStart >= opts.keepaliveDurationMs!) {
+                clearInterval(kaTimer);
+                for (const chunk of sseChunks!) {
+                  res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+                }
+                res.write("data: [DONE]\n\n");
+                res.end();
+              } else {
+                res.write(":keepalive\n\n");
+              }
+            }, opts.keepaliveMs);
+          } else {
+            for (const chunk of sseChunks) {
+              res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+            }
+            res.write("data: [DONE]\n\n");
+            res.end();
           }
-          res.write("data: [DONE]\n\n");
-          res.end();
         } else {
           res.writeHead(status, {
             "Content-Type": "application/json",
@@ -1412,5 +1437,58 @@ describe("server integration: adaptive request timeout scales with body size", (
       expect(secondary.callCount.value).toBe(0);
     },
     5000,
+  );
+});
+
+describe("server integration: keepalive bytes don't reset stream idle timeout", () => {
+  let shim: { server: http.Server; port: number };
+  let primary: MockUpstream;
+  let secondary: MockUpstream;
+
+  beforeAll(async () => {
+    // Primary sends keepalive comments for 200ms (longer than the 100ms
+    // idle timeout) before delivering real content. Without the fix, the
+    // keepalive bytes would reset the idle timer and the stream would
+    // eventually succeed. With the fix, the idle timeout fires because
+    // no actual SSE data payloads arrive within the timeout window.
+    primary = await startMockUpstream({
+      sseChunks: textSseChunks(),
+      keepaliveMs: 20,
+      keepaliveDurationMs: 200,
+    });
+    secondary = await startMockUpstream({ sseChunks: textSseChunks() });
+    const network: NetworkConfig = { streamIdleTimeoutMs: 100 };
+    const config = makeConfig(
+      { primary: primary.url, secondary: secondary.url },
+      { failover: true, providerOverrides: { primary: { network }, secondary: { network } } },
+    );
+    shim = await startShim(config);
+  });
+
+  afterAll(() => cleanup(shim.server, primary.server, secondary.server));
+
+  it(
+    "times out on keepalive-only primary and fails over to secondary",
+    async () => {
+      const { status, body } = await sendRequest(shim.port, basicRequest());
+      expect(status).toBe(200);
+
+      const { frames } = parseResponse(body);
+      const text = frames
+        .filter(
+          (f) =>
+            "textPart" in f &&
+            !(f as { textPart: { isFinal: boolean } }).textPart.isFinal,
+        )
+        .map((f) => (f as { textPart: { text: string } }).textPart.text)
+        .join("");
+      expect(text).toBe("Hello world");
+      expect(frames.some((f) => "error" in f)).toBe(false);
+
+      // Primary was attempted (and timed out due to keepalive-only); secondary served.
+      expect(primary.callCount.value).toBe(1);
+      expect(secondary.callCount.value).toBe(1);
+    },
+    10000,
   );
 });
