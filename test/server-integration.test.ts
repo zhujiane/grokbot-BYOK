@@ -1104,6 +1104,53 @@ describe("server integration: malformed request body", () => {
     },
     5000,
   );
+
+  it(
+    "rejects binary protobuf Content-Type with a clear error",
+    async () => {
+      // Send a valid Connect envelope but with application/connect+proto
+      // Content-Type. The shim should reject it early with a helpful message
+      // instead of trying to JSON.parse the binary payload.
+      const body = encodeEnvelope(DATA_FLAGS, Buffer.from("binary-payload", "utf8"));
+      const res = await new Promise<{ status: number; body: Buffer }>((resolve, reject) => {
+        const req = http.request(
+          {
+            hostname: "127.0.0.1",
+            port: shim.port,
+            path: STREAM_PATH,
+            method: "POST",
+            headers: {
+              "Content-Type": "application/connect+proto",
+              "Content-Length": String(body.length),
+            },
+          },
+          (r) => {
+            const chunks: Buffer[] = [];
+            r.on("data", (c: Buffer) => chunks.push(c));
+            r.on("end", () =>
+              resolve({ status: r.statusCode ?? 0, body: Buffer.concat(chunks) }),
+            );
+            r.on("error", reject);
+          },
+        );
+        req.on("error", reject);
+        req.write(body);
+        req.end();
+      });
+
+      expect(res.status).toBe(200);
+      const { frames } = parseResponse(res.body);
+      const errorFrame = frames.find((f) => "error" in f) as
+        | { error: { message: string } }
+        | undefined;
+      expect(errorFrame).toBeDefined();
+      expect(errorFrame!.error.message).toContain("binary protobuf not supported");
+
+      // The upstream was never contacted.
+      expect(upstream.callCount.value).toBe(0);
+    },
+    5000,
+  );
 });
 
 describe("server integration: unknown model routes to default provider", () => {
@@ -1276,5 +1323,62 @@ describe("server integration: client disconnect stops failover", () => {
       expect(secondary.callCount.value).toBe(0);
     },
     10000,
+  );
+});
+
+describe("server integration: adaptive request timeout scales with body size", () => {
+  let shim: { server: http.Server; port: number };
+  let primary: MockUpstream;
+  let secondary: MockUpstream;
+
+  beforeAll(async () => {
+    // Primary delays 80ms (beyond the 50ms base timeout, but within the
+    // adaptive timeout for a large body). Secondary responds immediately.
+    primary = await startMockUpstream({ delayMs: 80, sseChunks: textSseChunks() });
+    secondary = await startMockUpstream({ sseChunks: textSseChunks() });
+    // Base timeout is 50ms. With a large body (>50KB), the adaptive timeout
+    // adds ~1s, bringing the total to ~1050ms — well above the 80ms delay.
+    const network: NetworkConfig = { requestTimeoutMs: 50, maxRetries: 0 };
+    const config = makeConfig(
+      { primary: primary.url, secondary: secondary.url },
+      { failover: true, providerOverrides: { primary: { network } } },
+    );
+    shim = await startShim(config);
+  });
+
+  afterAll(() => cleanup(shim.server, primary.server, secondary.server));
+
+  it(
+    "does not time out when the request body is large enough to extend the timeout",
+    async () => {
+      // Build a request with a large system message (>50KB) so the adaptive
+      // timeout adds ~1s to the 50ms base. Role 4 = system.
+      const req = basicRequest();
+      const largeText = "x".repeat(60_000);
+      req.messages = [
+        { role: 4, text: largeText },
+        { role: 1, text: "hello" },
+      ];
+
+      const { status, body } = await sendRequest(shim.port, req);
+      expect(status).toBe(200);
+
+      const { frames } = parseResponse(body);
+      const text = frames
+        .filter(
+          (f) =>
+            "textPart" in f &&
+            !(f as { textPart: { isFinal: boolean } }).textPart.isFinal,
+        )
+        .map((f) => (f as { textPart: { text: string } }).textPart.text)
+        .join("");
+      expect(text).toBe("Hello world");
+      expect(frames.some((f) => "error" in f)).toBe(false);
+
+      // The primary served the request (didn't time out).
+      expect(primary.callCount.value).toBe(1);
+      expect(secondary.callCount.value).toBe(0);
+    },
+    5000,
   );
 });

@@ -95,6 +95,64 @@ const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 120_000;
  *  abort the stream and failover to the next provider. Set to 0 to disable. */
 const DEFAULT_TTFB_TIMEOUT_MS = 15_000;
 
+/**
+ * Adaptive timeout parameters. Large prompts (346k+ tokens / 1.3MB+ JSON) need
+ * more time for body upload and prefill. The base timeouts are scaled up by
+ * these factors so the shim doesn't abort requests that are still processing
+ * a massive context window.
+ *
+ * Observed in production: opencode-go takes 20-30s to respond for 346k token
+ * prompts (body ~1.3MB), and openrouter TTFB can be 10-55s for the same. The
+ * fixed 30s requestTimeout / 15s ttfbTimeout caused 56+9 aborts per session.
+ */
+const ADAPTIVE_TIMEOUT_BYTES_PER_MS = 50_000; // 1s per 50KB of request body
+const ADAPTIVE_TIMEOUT_MAX_EXTRA_MS = 60_000; // cap extra at 60s
+const ADAPTIVE_TTFB_TOKENS_PER_MS = 2_000;    // 1s per 2k estimated prompt tokens
+const ADAPTIVE_TTFB_MAX_EXTRA_MS = 60_000;    // cap extra at 60s
+
+/**
+ * Compute an adaptive request timeout that scales with the serialized request
+ * body size. Large bodies take longer to upload and trigger longer server-side
+ * prefill before response headers are sent. The base timeout is increased by
+ * ~1s per 50KB of body, capped at +60s.
+ */
+function adaptiveRequestTimeoutMs(baseMs: number, body: OpenAIChatRequest): number {
+  const bodySize = JSON.stringify(body).length;
+  const extra = Math.min(
+    Math.floor(bodySize / ADAPTIVE_TIMEOUT_BYTES_PER_MS) * 1000,
+    ADAPTIVE_TIMEOUT_MAX_EXTRA_MS,
+  );
+  return baseMs + extra;
+}
+
+/**
+ * Compute an adaptive TTFB timeout that scales with the estimated prompt token
+ * count. Providers need to process (prefill) the entire prompt before emitting
+ * the first token; for 346k tokens this takes 10-55s. The base TTFB timeout is
+ * increased by ~1s per 2k estimated tokens, capped at +60s.
+ *
+ * The estimate is rough (4 chars per token) — it only needs to be in the right
+ * ballpark to prevent premature aborts on large-context requests.
+ */
+function adaptiveTtfbTimeoutMs(baseMs: number, body: OpenAIChatRequest): number {
+  let chars = 0;
+  for (const msg of body.messages ?? []) {
+    if (typeof msg.content === "string") {
+      chars += msg.content.length;
+    } else if (Array.isArray(msg.content)) {
+      for (const part of msg.content) {
+        if (part.type === "text") chars += part.text?.length ?? 0;
+      }
+    }
+  }
+  const estimatedTokens = Math.ceil(chars / 4);
+  const extra = Math.min(
+    Math.floor(estimatedTokens / ADAPTIVE_TTFB_TOKENS_PER_MS) * 1000,
+    ADAPTIVE_TTFB_MAX_EXTRA_MS,
+  );
+  return baseMs + extra;
+}
+
 /** Shadow probe frequency: every Nth request, send a concurrent probe to
  *  the second-best provider to calibrate performance scores with true
  *  apples-to-apples data (same request, same prompt, direct comparison).
@@ -238,8 +296,14 @@ async function shadowProbe(
   requestId: string,
 ): Promise<void> {
   const key = provider.selectKey();
-  const probeTimeoutMs = provider.network.requestTimeoutMs ?? 30000;
-  const ttfbTimeoutMs = provider.network.ttfbTimeoutMs ?? DEFAULT_TTFB_TIMEOUT_MS;
+  const probeTimeoutMs = adaptiveRequestTimeoutMs(
+    provider.network.requestTimeoutMs ?? 30000,
+    body,
+  );
+  const ttfbTimeoutMs = adaptiveTtfbTimeoutMs(
+    provider.network.ttfbTimeoutMs ?? DEFAULT_TTFB_TIMEOUT_MS,
+    body,
+  );
 
   // Deep-clone the body and apply compat for the shadow provider.
   const probeBody = JSON.parse(JSON.stringify(body)) as OpenAIChatRequest;
@@ -463,6 +527,22 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
     // sites automatically include the request ID without any changes.
     const requestId = generateRequestId();
     const logger = createRequestScopedLogger(baseLogger, requestId);
+
+    // Reject binary protobuf Connect requests early. The shim only speaks
+    // Connect+JSON (useBinaryFormat: false in the patched host). If the client
+    // sends application/connect+proto, the envelope parses but JSON.parse on
+    // the protobuf payload fails with a cryptic "Unexpected token" error.
+    // Detecting the Content-Type here lets us return a clear error instead.
+    const contentType = req.headers["content-type"] ?? "";
+    if (contentType.includes("proto") && !contentType.includes("json")) {
+      logger.warn("rejected binary protobuf request", { contentType });
+      startConnectResponse(res, 200);
+      writeFrame(res, makeErrorFrame(
+        "binary protobuf not supported; ensure useBinaryFormat: false in the Connect transport",
+      ));
+      endStream(res);
+      return;
+    }
 
     // Track client disconnects so the upstream stream can be aborted early
     // (instead of continuing to fetch and process chunks that will never be
@@ -778,8 +858,10 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
         provider.network.retryBackoffInitialMs ?? DEFAULT_RETRY_BACKOFF_INITIAL_MS;
       const backoffMaxMs =
         provider.network.retryBackoffMaxMs ?? DEFAULT_RETRY_BACKOFF_MAX_MS;
-      const requestTimeoutMs =
-        provider.network.requestTimeoutMs ?? config.requestTimeoutMs;
+      const requestTimeoutMs = adaptiveRequestTimeoutMs(
+        provider.network.requestTimeoutMs ?? config.requestTimeoutMs,
+        openaiBody,
+      );
 
       let authRotations = 0;
       for (let attempt = 0; attempt <= maxRetries; attempt++) {
@@ -1045,8 +1127,10 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
     // ---------------------------------------------------------------------
     let { resp: firstResp, providerName, model, key, network, baseUrl, compat } =
       connected;
-    let requestTimeoutMs =
-      network.requestTimeoutMs ?? config.requestTimeoutMs;
+    let requestTimeoutMs = adaptiveRequestTimeoutMs(
+      network.requestTimeoutMs ?? config.requestTimeoutMs,
+      openaiBody,
+    );
 
     // -----------------------------------------------------------------
     // 10a. Shadow probe: every Nth request, fire a concurrent fetch to
@@ -1152,7 +1236,10 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
       // before the first token is seen.
       let ttfbTimedOut = false;
       let ttfbTimer: ReturnType<typeof setTimeout> | undefined;
-      const ttfbTimeoutMs = network.ttfbTimeoutMs ?? DEFAULT_TTFB_TIMEOUT_MS;
+      const ttfbTimeoutMs = adaptiveTtfbTimeoutMs(
+        network.ttfbTimeoutMs ?? DEFAULT_TTFB_TIMEOUT_MS,
+        openaiBody,
+      );
       let totalTokens: number | undefined;
       let reasoningTokens: number | undefined;
       let cachedTokens: number | undefined;
@@ -1842,7 +1929,10 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
       baseUrl = nextProvider.baseUrl;
       compat = nextProvider.compat;
       network = nextProvider.network;
-      requestTimeoutMs = network.requestTimeoutMs ?? config.requestTimeoutMs;
+      requestTimeoutMs = adaptiveRequestTimeoutMs(
+        network.requestTimeoutMs ?? config.requestTimeoutMs,
+        openaiBody,
+      );
       applyCompatToRequest(openaiBody, compat, model, nextProvider.name, nextProvider.baseUrl);
       triedProviderNames.add(nextProvider.name);
     }
