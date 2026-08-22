@@ -1335,6 +1335,18 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
         // Feed the whole chunk; the accumulator skips choices without tool_calls.
         toolAcc.feed(chunk);
 
+        // Tool calls count as first-token content for TTFB purposes. Without
+        // this, a tool-call-only response (no text/reasoning deltas) would
+        // never set ttfbMs, leaving the TTFB timer running for the entire
+        // stream. If the stream exceeded the TTFB timeout, it would be
+        // incorrectly aborted even though the provider was actively sending
+        // tool-call deltas. Observed in production: 25/30 requests had
+        // ttfb=undefined because they were tool-call-only responses.
+        if (ttfbMs === undefined && toolAcc.size > 0) {
+          ttfbMs = Date.now() - streamStartMs;
+          if (ttfbTimer) { clearTimeout(ttfbTimer); ttfbTimer = undefined; }
+        }
+
         for (const choice of chunk.choices ?? []) {
           // Forward reasoning content (chain-of-thought) as text frames so the
           // host sees the model's reasoning alongside the final answer. Some

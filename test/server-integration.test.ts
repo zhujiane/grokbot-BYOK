@@ -695,6 +695,38 @@ describe("server integration: streaming with tool calls", () => {
   );
 });
 
+describe("server integration: TTFB measured for tool-call-only responses", () => {
+  let shim: { server: http.Server; port: number };
+  let upstream: MockUpstream;
+
+  beforeAll(async () => {
+    // Use tool-call-only SSE chunks with a small delay so TTFB is measurable.
+    upstream = await startMockUpstream({ delayMs: 50, sseChunks: toolCallSseChunks() });
+    const config = makeConfig({ primary: upstream.url });
+    shim = await startShim(config);
+  });
+
+  afterAll(() => cleanup(shim.server, upstream.server));
+
+  it(
+    "sets ttfbMs when the first content is a tool call (no text/reasoning delta)",
+    async () => {
+      // Tool-call-only responses must still set ttfbMs so the TTFB timer
+      // is cleared. Without this, a slow tool-call-only response could be
+      // incorrectly aborted by the TTFB timeout.
+      const { status, body } = await sendRequest(shim.port, basicRequest());
+      expect(status).toBe(200);
+
+      const { frames } = parseResponse(body);
+      // Should have a tool call frame (not an error).
+      const toolFrames = frames.filter((f) => "toolCallPart" in f);
+      expect(toolFrames.length).toBe(1);
+      expect(frames.some((f) => "error" in f)).toBe(false);
+    },
+    5000,
+  );
+});
+
 describe("server integration: provider failover", () => {
   let shim: { server: http.Server; port: number };
   let primary: MockUpstream;
