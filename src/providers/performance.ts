@@ -38,8 +38,12 @@ const ALPHA = 0.3;
 /** Minimum samples before trusting the score (use priority order below this). */
 const MIN_SAMPLES = 3;
 
-/** Penalty multiplier per error: each error reduces effective score by 20%. */
-const ERROR_PENALTY = 0.2;
+/** Penalty multiplier per error: each unit of error rate (0..1) increases
+ *  the score by this factor. At 3.0, a 30% error rate gives 1.9x penalty
+ *  and a 100% error rate gives 4x — enough to deprioritize unreliable
+ *  providers without making the score explode (which would prevent
+ *  re-exploration once the provider recovers). */
+const ERROR_PENALTY = 3.0;
 
 /** After this many ms since the last sample, a provider's data is considered
  *  stale and its score is decayed toward zero to encourage re-exploration.
@@ -257,8 +261,8 @@ class PerformanceTracker {
 
     // Combined: estimated total time for the reference workload,
     // penalized by error rate. Each unit of error rate (0..1) increases
-    // the score by ERROR_PENALTY (20%), so a fully failing provider
-    // (errorRate=1) gets a 1.2x penalty — enough to deprioritize it
+    // the score by ERROR_PENALTY (3x), so a fully failing provider
+    // (errorRate=1) gets a 4x penalty — enough to deprioritize it
     // without making the score explode (which would prevent re-exploration
     // once the provider recovers).
     const errorPenalty = 1 + p.errorRate * ERROR_PENALTY;

@@ -105,9 +105,10 @@ describe("PerformanceTracker — score", () => {
     const flakyScore = tracker.score("flaky");
     // Flaky should be worse (higher) due to error penalty.
     expect(flakyScore).toBeGreaterThan(cleanScore);
-    // But the penalty should be modest (1.2x at 100% error, so ~1.1x at 50%),
-    // not 10x or 100x — which would prevent re-exploration after recovery.
-    expect(flakyScore / cleanScore).toBeLessThan(2);
+    // At 50% error rate, penalty = 1 + 0.5 * 3.0 = 2.5x. The penalty is
+    // significant enough to deprioritize unreliable providers, but not so
+    // extreme (10x+) that re-exploration after recovery is impossible.
+    expect(flakyScore / cleanScore).toBeLessThan(4);
   });
 
   it("uses the default prefill rate when no TTFB data was ever recorded", () => {
