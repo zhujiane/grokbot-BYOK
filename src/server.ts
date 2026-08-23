@@ -959,6 +959,7 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
               });
               recordAttempt(provider.name, model, "auth", attemptStart, "all keys exhausted with auth errors", keyOrdinal);
               metrics.recordRequest(provider.name, false, Date.now() - attemptStart);
+              breaker.recordAuthExhaustion(provider.name);
               break;
             }
             // Don't consume a retry attempt for key rotation.
@@ -1305,9 +1306,9 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
         // trailing usage-only chunks. Firing here is expected cleanup,
         // not an error, so don't flip streamError/idleTimedOut (which
         // would trigger failover) — just cancel the reader and log at
-        // debug level.
+        // info level.
         if (graceStarted) {
-          logger.debug("stream grace timeout", {
+          logger.info("stream grace timeout", {
             model,
             provider: providerName,
             elapsed: Date.now() - requestStart,
@@ -1551,6 +1552,12 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
         try {
           resp = await fetchCompletion(baseUrl, openaiBody, key, requestTimeoutMs);
           if (!resp.ok || !resp.body) {
+            // If the retry fetch hits an auth error (401/402/403), the
+            // provider's credentials are exhausted — open the circuit so
+            // the provider isn't tried again on subsequent requests.
+            if (resp.status === 401 || resp.status === 402 || resp.status === 403) {
+              breaker.recordAuthExhaustion(providerName);
+            }
             logger.warn("empty-completion retry fetch failed", {
               model,
               provider: providerName,

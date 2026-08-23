@@ -41,6 +41,7 @@ export type ErrorType =
 /** Default cooldowns when a provider has no explicit NetworkConfig. */
 const DEFAULT_RATE_LIMIT_COOLDOWN_MS = 10000;
 const DEFAULT_SERVER_ERROR_COOLDOWN_MS = 30000;
+const DEFAULT_AUTH_EXHAUSTION_COOLDOWN_MS = 300000;
 const DEFAULT_FAILURE_THRESHOLD = 3;
 
 interface CircuitState {
@@ -92,6 +93,9 @@ export class CircuitBreaker {
     const cfg = this.configs.get(providerName);
     if (errorType === "rate-limit") {
       return cfg?.rateLimitCooldownMs ?? this.defaultRateLimitCooldownMs;
+    }
+    if (errorType === "auth-error") {
+      return DEFAULT_AUTH_EXHAUSTION_COOLDOWN_MS;
     }
     // server-error, network-error both use the server-error cooldown.
     return cfg?.serverErrorCooldownMs ?? this.defaultServerErrorCooldownMs;
@@ -280,6 +284,30 @@ export class CircuitBreaker {
       state.openedByErrorType = errorType;
       state.cooldownMs = this.getCooldownMs(providerName, errorType);
     }
+  }
+
+  /**
+   * Force-open the circuit for a provider whose auth credentials are
+   * exhausted — i.e. every available key returned an auth/billing error
+   * (401/402/403, e.g. Venice "Insufficient USD or Diem balance"). Normal
+   * auth errors are key-level concerns handled by rotating the dead key and
+   * are NOT recorded against the provider circuit. But once all keys are
+   * spent, there is no point re-selecting this provider on every subsequent
+   * request, so this method benches it for a long cooldown (5 minutes) while
+   * the billing/credential issue is unlikely to resolve.
+   *
+   * The existing `shouldTry()` check (`now - openedAt >= cooldownMs`)
+   * automatically allows a half-open probe after the cooldown elapses.
+   */
+  recordAuthExhaustion(providerName: string): void {
+    const state = this.getOrCreate(providerName);
+    const now = Date.now();
+    state.open = true;
+    state.openedAt = now;
+    state.openedByErrorType = "auth-error";
+    state.cooldownMs = DEFAULT_AUTH_EXHAUSTION_COOLDOWN_MS;
+    state.failures = this.getFailureThreshold(providerName);
+    state.lastFailureTime = now;
   }
 
   /** Current state snapshot for logging/diagnostics. */
