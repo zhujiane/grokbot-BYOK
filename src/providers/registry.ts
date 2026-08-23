@@ -231,7 +231,7 @@ export class ProviderRegistry {
     // providers accumulate fresh performance data, preventing the router
     // from getting locked into one provider and never discovering that
     // another has become faster.
-    if (performanceTracker.shouldExplore(eligible.length)) {
+    if (performanceTracker.shouldExplore(eligible.length, eligible.map(p => p.name))) {
       const idx = Math.floor(Math.random() * eligible.length);
       return eligible[idx];
     }
@@ -241,6 +241,7 @@ export class ProviderRegistry {
     // so they get tried before poor-performing providers but after
     // good-performing ones. Staleness decay in score() also pushes
     // providers with old data to the front for re-sampling.
+    const errorRates = performanceTracker.errorRates();
     const ranked = eligible
       .map((p, idx) => ({
         provider: p,
@@ -250,6 +251,7 @@ export class ProviderRegistry {
           workload?.completionTokens,
         ),
         priorityIdx: idx,
+        errorRate: errorRates[p.name] ?? 0,
       }))
       .sort((a, b) => {
         // Both have data: compare scores directly.
@@ -260,8 +262,19 @@ export class ProviderRegistry {
         if (a.score === Infinity && b.score === Infinity) {
           return a.priorityIdx - b.priorityIdx;
         }
-        // One has data, one doesn't: prefer the one with data.
-        return a.score === Infinity ? 1 : -1;
+        // One has data, one doesn't. Normally prefer the one with data
+        // (known performance over unknown). But if the known provider has
+        // a high error rate (> 50%), prefer the unknown one — it's better
+        // to explore a new provider than to keep hitting a failing one.
+        // This prevents cold-start lockout after a restart where only one
+        // provider has data and it's bad.
+        if (a.score === Infinity) {
+          // b has data, a doesn't — prefer a if b is failing badly.
+          return b.errorRate > 0.5 ? -1 : 1;
+        } else {
+          // a has data, b doesn't — prefer b if a is failing badly.
+          return a.errorRate > 0.5 ? 1 : -1;
+        }
       });
 
     return ranked[0].provider;

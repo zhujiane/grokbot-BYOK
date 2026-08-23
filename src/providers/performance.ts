@@ -281,6 +281,18 @@ class PerformanceTracker {
     return baseScore * stalenessDecay;
   }
 
+  /** Get the current error rate for each provider (0..1). Providers with
+   *  no data are not included (caller should default to 0). */
+  errorRates(): Record<string, number> {
+    const result: Record<string, number> = {};
+    for (const [name, p] of this.perf) {
+      if (p.samples >= MIN_SAMPLES) {
+        result[name] = p.errorRate;
+      }
+    }
+    return result;
+  }
+
   /** Get a snapshot of all provider performance stats. */
   snapshot(): Record<string, {
     samples: number;
@@ -340,9 +352,22 @@ class PerformanceTracker {
    *
    * The exploration is only triggered when there are multiple eligible
    * providers — a single-provider setup always exploits.
+   *
+   * When some eligible providers have no data yet (cold start after restart,
+   * or a newly added provider), the exploration rate is boosted to 50% to
+   * quickly accumulate data for all providers. Without this boost, the router
+   * would keep selecting the first provider with data (by priority order)
+   * and never explore the others.
    */
-  shouldExplore(eligibleCount: number): boolean {
+  shouldExplore(eligibleCount: number, eligibleNames?: string[]): boolean {
     if (eligibleCount <= 1) return false;
+    // Cold-start boost: if any eligible provider has no data, explore aggressively.
+    if (eligibleNames) {
+      const hasColdProvider = eligibleNames.some(n => !this.hasEnoughData(n));
+      if (hasColdProvider) {
+        return Math.random() < 0.5;
+      }
+    }
     return Math.random() < DEFAULT_EPSILON;
   }
 
