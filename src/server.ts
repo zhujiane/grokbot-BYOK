@@ -1300,6 +1300,23 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
         if (streamClosed) {
           return;
         }
+        // Post-finish grace timeout: the stream already completed
+        // successfully (sawFinish) and we were just waiting for any
+        // trailing usage-only chunks. Firing here is expected cleanup,
+        // not an error, so don't flip streamError/idleTimedOut (which
+        // would trigger failover) — just cancel the reader and log at
+        // debug level.
+        if (graceStarted) {
+          logger.debug("stream grace timeout", {
+            model,
+            provider: providerName,
+            elapsed: Date.now() - requestStart,
+          });
+          void reader?.cancel().catch(() => {
+            // ignore cancel rejection
+          });
+          return;
+        }
         streamError = true;
         idleTimedOut = true;
         logger.error("stream idle timeout", {
@@ -1530,6 +1547,7 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
 
       let resp = existingResp;
       if (!resp) {
+        const retryStartMs = Date.now();
         try {
           resp = await fetchCompletion(baseUrl, openaiBody, key, requestTimeoutMs);
           if (!resp.ok || !resp.body) {
@@ -1538,7 +1556,8 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
               provider: providerName,
               status: resp.status,
               key: maskKey(key.value),
-              elapsed: Date.now() - requestStart,
+              elapsed: Date.now() - retryStartMs,
+              totalElapsed: Date.now() - requestStart,
             });
             frames.push(makeErrorFrame("upstream retry failed"));
             return {
@@ -1564,7 +1583,8 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
             provider: providerName,
             key: maskKey(key.value),
             error: err,
-            elapsed: Date.now() - requestStart,
+            elapsed: Date.now() - retryStartMs,
+            totalElapsed: Date.now() - requestStart,
           });
           frames.push(makeErrorFrame("upstream retry failed"));
           return {
