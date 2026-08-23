@@ -603,6 +603,7 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
     let openaiBody: OpenAIChatRequest;
     let rawModelId: string;
     let sessionId: string | null = null;
+    let estimatedInputTokens = 0;
     try {
       const envelopes: ConnectEnvelope[] = parseEnvelopes(body);
       const dataEnvelope = envelopes.find((env) => (env.flags & 0x02) === 0);
@@ -623,6 +624,13 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
       sessionId = sessionAffinity.extractSessionId(reqJson);
 
       openaiBody = convertRequest(reqJson);
+
+      // Estimate input tokens for provider routing. The exact count depends
+      // on the model's tokenizer, but this rough estimate (4 chars/token) is
+      // good enough for comparing prefill costs across providers.
+      estimatedInputTokens = Math.ceil(
+        JSON.stringify(openaiBody.messages ?? []).length / 4,
+      );
     } catch (err) {
       // Client-side issue (malformed Connect envelope, wrong content type
       // like protobuf, or invalid JSON) — not a provider health problem.
@@ -664,7 +672,10 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
     //      failover chain.
     // ---------------------------------------------------------------------
     let { provider: resolvedPrimary, normalizedId } =
-      registry.resolveProvider(rawModelId);
+      registry.resolveProvider(rawModelId, {
+        promptTokens: estimatedInputTokens,
+        completionTokens: openaiBody.max_tokens,
+      });
 
     // Vision fallback: if the request contains images and the resolved
     // model doesn't support vision, re-route to VISION_FALLBACK_MODEL
@@ -677,7 +688,10 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
           originalProvider: resolvedPrimary.name,
           visionFallbackModel: config.visionFallbackModel,
         });
-        const visionResolved = registry.resolveProvider(config.visionFallbackModel);
+        const visionResolved = registry.resolveProvider(config.visionFallbackModel, {
+          promptTokens: estimatedInputTokens,
+          completionTokens: openaiBody.max_tokens,
+        });
         rawModelId = config.visionFallbackModel;
         normalizedId = visionResolved.normalizedId;
         resolvedPrimary = visionResolved.provider;
@@ -736,9 +750,6 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
     //     Rejects oversized requests before any provider is tried, and caps
     //     max_tokens when the client didn't specify one.
     // ---------------------------------------------------------------------
-    const estimatedInputTokens = Math.ceil(
-      JSON.stringify(openaiBody.messages ?? []).length / 4,
-    );
     const budgetResult = applyTokenBudget(estimatedInputTokens, openaiBody.max_tokens);
     if (budgetResult.rejection) {
       logger.warn("token budget exceeded", {

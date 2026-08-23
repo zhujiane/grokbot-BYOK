@@ -222,18 +222,23 @@ class PerformanceTracker {
    * Returns Infinity for providers with no data (so they're tried last
    * and the priority order is used as a tiebreaker).
    */
-  score(provider: string): number {
+  score(provider: string, promptTokens?: number, completionTokens?: number): number {
     const p = this.perf.get(provider);
     if (!p || p.samples < MIN_SAMPLES) return Infinity;
 
-    // Reference workload: use rolling average, or fall back to a
-    // reasonable default (10K prompt, 500 completion) if no data yet.
-    const refPrompt = this.workload.samples > 0
-      ? this.workload.avgPromptTokens
-      : 10000;
-    const refCompletion = this.workload.samples > 0
-      ? this.workload.avgCompletionTokens
-      : 500;
+    // Reference workload: use the supplied request size when scoring for a
+    // specific request, or fall back to the rolling average of all requests
+    // when no size is supplied (e.g., tests and snapshots).
+    const refPrompt = promptTokens !== undefined
+      ? promptTokens
+      : this.workload.samples > 0
+        ? this.workload.avgPromptTokens
+        : 10000;
+    const refCompletion = completionTokens !== undefined
+      ? completionTokens
+      : this.workload.samples > 0
+        ? this.workload.avgCompletionTokens
+        : 500;
 
     // Prefill term: ms per prompt token × reference prompt size.
     // If no prefill data has been recorded yet (sentinel value), use a

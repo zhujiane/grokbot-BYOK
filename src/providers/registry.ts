@@ -81,7 +81,10 @@ export class ProviderRegistry {
    * can pass the normalized id to `provider.resolveModel` without
    * re-normalizing. Selection honors the configured routing strategy.
    */
-  resolveProvider(modelId: string): { provider: Provider; normalizedId: string } {
+  resolveProvider(
+    modelId: string,
+    workload?: { promptTokens?: number; completionTokens?: number },
+  ): { provider: Provider; normalizedId: string } {
     const normalizedId = normalizeModelId(modelId);
 
     if (this.strategy === "round-robin") {
@@ -95,7 +98,7 @@ export class ProviderRegistry {
         return { provider: selected, normalizedId };
       }
     } else if (this.strategy === "latency") {
-      const selected = this.selectByLatency(normalizedId);
+      const selected = this.selectByLatency(normalizedId, workload);
       if (selected) {
         return { provider: selected, normalizedId };
       }
@@ -211,7 +214,10 @@ export class ProviderRegistry {
    * The failover chain (built by getFailoverChain) follows the same
    * performance ordering so failover goes to the next-best provider.
    */
-  private selectByLatency(normalizedId: string): Provider | undefined {
+  private selectByLatency(
+    normalizedId: string,
+    workload?: { promptTokens?: number; completionTokens?: number },
+  ): Provider | undefined {
     const eligible = this.eligibleProviders(normalizedId);
     if (eligible.length === 0) {
       return undefined;
@@ -236,7 +242,15 @@ export class ProviderRegistry {
     // good-performing ones. Staleness decay in score() also pushes
     // providers with old data to the front for re-sampling.
     const ranked = eligible
-      .map((p, idx) => ({ provider: p, score: performanceTracker.score(p.name), priorityIdx: idx }))
+      .map((p, idx) => ({
+        provider: p,
+        score: performanceTracker.score(
+          p.name,
+          workload?.promptTokens,
+          workload?.completionTokens,
+        ),
+        priorityIdx: idx,
+      }))
       .sort((a, b) => {
         // Both have data: compare scores directly.
         if (a.score !== Infinity && b.score !== Infinity) {
