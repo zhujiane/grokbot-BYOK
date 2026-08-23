@@ -1970,7 +1970,17 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
       // in the failover chain. A mid-stream error (not fetch, not timeout) is
       // non-retryable: the provider started responding then broke, so the
       // client should get the error rather than burning more providers.
-      if (result.hasVisibleContent || (result.streamError && !result.ttfbTimedOut && !result.idleTimedOut && !result.fetchFailed)) {
+      //
+      // When the stream idle timeout fires after some content was produced,
+      // the content is incomplete (the provider stalled mid-generation).
+      // Discard the partial content and try the next provider — the client
+      // gets a complete response from a fallback instead of a truncated one
+      // with an error frame. This is safe because frames are buffered and
+      // not yet flushed to the client.
+      if (
+        (result.hasVisibleContent && !result.idleTimedOut) ||
+        (result.streamError && !result.ttfbTimedOut && !result.idleTimedOut && !result.fetchFailed)
+      ) {
         break;
       }
 
