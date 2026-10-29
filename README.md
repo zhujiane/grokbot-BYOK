@@ -4,7 +4,7 @@
 
 ## 网页使用
 
-访问部署地址（当前为 `http://172.26.115.39:8789/`），用 `.env` 中的 `UI_USERNAME` / `UI_PASSWORD` 登录。登录会话有效期 24 小时，页面调用接口、播放和下载均无需填写 API Key。
+访问部署地址（当前为 `http://{ip}:8789/`），用 `.env` 中的 `UI_USERNAME` / `UI_PASSWORD` 登录。登录会话有效期 24 小时，页面调用接口、播放和下载均无需填写 API Key。
 
 1. 左下角「登录凭证」可下载导出脚本，在已登录 Grok Bot 的 Windows 上按提示执行，再上传生成的 JSON。
 2. 左侧新建、切换或删除会话；右侧按对话顺序显示提示词、进度和视频。底部输入提示词，Enter 生成，Shift + Enter 换行。
@@ -69,7 +69,7 @@ docker compose logs --tail=50 api
 网页登录后可直接使用视频接口，无需额外传 API Key。外部程序仍可使用 Bearer Token，或先登录 `/ui/login` 获取会话 Cookie；Cookie 登录及写操作须提供与服务地址一致的 `Origin` 请求头。
 
 ```bash
-BASE_URL=http://172.26.115.39:8789
+BASE_URL=http://{ip}:8789
 curl --fail-with-body -c cookies.txt "$BASE_URL/ui/login" \
   -H "Origin: $BASE_URL" -H 'Content-Type: application/json' \
   -d '{"username":"admin","password":"你的管理员密码"}'
@@ -78,10 +78,10 @@ curl --fail-with-body -b cookies.txt "$BASE_URL/v1/videos/generations" \
   -d '{"model":"grok-bot-video","prompt":"一只橘猫在花园里散步","duration":4,"aspect_ratio":"16:9","resolution":"720p"}'
 ```
 
-以下为 Bearer Token 的 Bash 示例。当前部署地址 `http://172.26.115.39:8789`；客户端令牌使用 `.env` 中的 `API_TOKEN`，不要使用桌面凭证里的 token。
+以下为 Bearer Token 的 Bash 示例。当前部署地址 `http://{ip}:8789`；客户端令牌使用 `.env` 中的 `API_TOKEN`，不要使用桌面凭证里的 token。
 
 ```bash
-BASE_URL=http://172.26.115.39:8789
+BASE_URL=http://{ip}:8789
 export API_TOKEN='你的客户端令牌'
 
 curl -sS "$BASE_URL/healthz"
