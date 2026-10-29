@@ -80,7 +80,48 @@ const sessionAffinitySchema = z.object({
 });
 
 /** Validation schema for the full shim configuration. */
+export const videoConfigSchema = z.object({
+  enabled: z.boolean().default(false),
+  baseUrl: z.string().url().default("https://api.x.ai/v1"),
+  apiKey: z.string().default(""),
+  apiToken: z.string().default(""),
+  defaultModel: z.string().min(1).default("grok-imagine-video"),
+  jobsDir: z.string().min(1).default("data/video-jobs"),
+  requestTimeoutMs: z.number().int().positive().default(60000),
+  maxBodyBytes: z.number().int().positive().default(20 * 1024 * 1024),
+}).superRefine((value, ctx) => {
+  if (!value.enabled) return;
+  for (const field of ["apiKey", "apiToken"] as const) {
+    if (!value[field].trim() || value[field].includes("${")) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: [field], message: "Required when video API is enabled; resolve environment placeholders first" });
+    }
+  }
+});
+
 export const shimConfigSchema = z.object({
+  api: z.object({
+    enabled: z.boolean().default(false),
+    apiToken: z.string().default(""),
+    allowConnect: z.boolean().default(false),
+    maxBodyBytes: z.number().int().positive().default(2 * 1024 * 1024),
+  }).superRefine((value, ctx) => {
+    if (value.enabled && (!value.apiToken.trim() || value.apiToken.includes("${"))) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["apiToken"], message: "Set API_TOKEN before enabling the REST API" });
+    }
+  }).optional(),
+  grokBot: z.object({
+    enabled: z.boolean().default(false),
+    credentialsFile: z.string().min(1).default("secrets/grok-bot-session.json"),
+    requestTimeoutMs: z.number().int().positive().default(30000),
+    videoEnabled: z.boolean().default(false),
+    chatEnabled: z.boolean().default(false),
+    jobsDir: z.string().min(1).default("data/desktop-jobs"),
+    jobTimeoutMs: z.number().int().positive().default(1800000),
+    chatTimeoutMs: z.number().int().positive().default(120000),
+    pollIntervalMs: z.number().int().min(10).default(2000),
+    maxConcurrentJobs: z.number().int().min(1).max(32).default(4),
+  }).optional(),
+  video: videoConfigSchema.optional(),
   port: z.number().default(8788),
   host: z.string().default("127.0.0.1"),
   logDir: z.string().default(""),

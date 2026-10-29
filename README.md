@@ -1,866 +1,219 @@
-# grokbot-BYOK
+# Grok Bot 视频 API
 
-<p align="center">
-  <img src="assets/logo.png" width="300" alt="grokbot-BYOK">
-</p>
+使用 Grok Bot 桌面端已有登录凭证，通过 Docker 提供视频生成 API。默认模型 `grok-bot-video`，无需 `XAI_API_KEY`。每个任务创建独立 Bot，只提交一次生成请求；查询与下载不会追加对话。
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Node: 18+](https://img.shields.io/badge/Node.js-18%2B-green.svg)](https://nodejs.org/)
-[![TypeScript](https://img.shields.io/badge/TypeScript-5.3-blue.svg)](https://www.typescriptlang.org/)
-[![Tests: 359](https://img.shields.io/badge/Tests-359%20passed-brightgreen.svg)](#tests)
+## 网页使用
 
-**Route Grok Bot's AI inference through your own LLM API keys.**
+访问部署地址（当前为 `http://172.26.115.39:8789/`），用 `.env` 中的 `UI_USERNAME` / `UI_PASSWORD` 登录。登录会话有效期 24 小时，页面调用接口、播放和下载均无需填写 API Key。
 
-Grok Bot BYOK is a local proxy that intercepts Grok Bot's inference calls
-(chat, tab-completion, agent mode) and routes them to any OpenAI-compatible
-LLM provider you choose: OpenRouter, OpenCode, Kilo, a local model server,
-or all of the above with automatic failover. No more paying for the
-hosted backend.
+1. 左下角「登录凭证」可下载导出脚本，在已登录 Grok Bot 的 Windows 上按提示执行，再上传生成的 JSON。
+2. 左侧新建、切换或删除会话；右侧按对话顺序显示提示词、进度和视频。底部输入提示词，Enter 生成，Shift + Enter 换行。
+3. 选择「首尾帧模式」或「多参考图模式」（最多 8 张），直接上传、拖拽或粘贴图片。底部可设置时长、比例、分辨率；「配置」内可切换 xAI / OpenAI、引用 HTTPS 图片、添加最多 16 个关键帧、查看请求参数。两种模式仅提交当前模式的图片，关键帧独立生效。
+4. 切换会话后任务仍自动查询；完成后直接预览、下载 MP4 或复用提示词。查询和下载不会追加 Bot 对话。上游多图效果仍取决于工具实际支持。
 
-You bring the keys (BYOK = Bring Your Own Key). Grok Bot BYOK handles the
-rest: protocol translation, routing, failover, and automatic re-patching
-when Grok Bot updates itself.
+浏览器 `localStorage` 保存会话、各会话参数草稿与任务记录，旧版任务自动迁入「之前的视频任务」。不保存账号密码、桌面凭证或图片；图片仅在当前页面内存中随会话保留，刷新后需重新添加。删除会话仅删除本机记录，无需数据库。
 
----
+网页上传的凭证以 `0600` 权限写入 `video-data` 卷的 `/app/data/ui-session.json`，立即生效且优先于只读 `secrets/grok-bot-session.json`；后续更新请继续在网页上传。已导入的凭证不会回传浏览器。清空浏览器历史不会删除服务端任务和凭证。
 
-## Table of contents
+网页登录使用 HttpOnly / SameSite Cookie。局域网 HTTP 可使用；公网访问请在反向代理上启用 HTTPS。修改 `UI_PASSWORD` 后重建容器会使已有登录会话失效：`docker compose up -d`。
 
-- [What it does](#what-it-does)
-- [Quick start](#quick-start)
-- [How it works](#how-it-works)
-- [Providers](#providers)
-- [Configuration](#configuration)
-- [Managing daemons](#managing-daemons)
-- [Uninstall](#uninstall)
-- [Routing strategies](#routing-strategies)
-- [Failover and circuit breaking](#failover-and-circuit-breaking)
-- [Latency-based routing](#latency-based-routing)
-- [Session affinity](#session-affinity)
-- [Vision fallback](#vision-fallback)
-- [Tool call handling](#tool-call-handling)
-- [Observability](#observability)
-- [Guardrails](#guardrails)
-- [Deploy](#deploy)
-- [Troubleshooting](#troubleshooting)
-- [Tests](#tests)
-- [Build](#build)
-- [Project structure](#project-structure)
-- [License](#license)
+## 登录凭证
 
----
+在 Windows 打开已登录的 Grok Bot，连接云电脑。将 [导出脚本](scripts/export-grok-bot-session.cjs) 复制到本机，使用同一 Windows 用户运行 Node.js 22+：
 
-## What it does
-
-Grok Bot talks to Grok Bot BYOK (this project) using Connect-RPC, a
-gRPC-over-HTTP streaming protocol with binary-framed envelopes. The
-backends themselves are OpenAI-compatible chat completion endpoints, but
-the wire format is different. Grok Bot sends Connect. Providers expect
-OpenAI SSE.
-
-Grok Bot BYOK sits between them:
-
-```mermaid
-graph LR
-    GrokBot["Grok Bot (Connect-RPC, binary)"] -->|"POST /Stream"| BYOK
-    BYOK["Grok Bot BYOK (localhost:8788)"] -->|"OpenAI SSE (JSON)"| Provider1["OpenRouter"]
-    BYOK -->|"OpenAI SSE (JSON)"| Provider2["OpenCode Go"]
-    BYOK -->|"OpenAI SSE (JSON)"| Provider3["Kilo"]
-    BYOK -->|"OpenAI SSE (JSON)"| Provider4["Local"]
-    Provider1 -->|"your keys"| Keys1["sk-or-xxx"]
-    Provider2 -->|"your keys"| Keys2["sk-xxx"]
-    Provider3 -->|"keyless"| Keys3["200 req/hr"]
-    Provider4 -->|"your keys"| Keys4["sk-local"]
+```powershell
+node .\export-grok-bot-session.cjs --include-backend --output "$env:USERPROFILE\grok-bot-session-with-backend.json"
 ```
 
-Grok Bot BYOK:
-1. **Receives** Connect-RPC streaming requests from Grok Bot
-2. **Translates** them to OpenAI chat completion format
-3. **Routes** to the best available provider (priority, latency, or round-robin)
-4. **Fails over** automatically if a provider errors, rate-limits, or stalls
-5. **Translates** the OpenAI SSE response back to Connect frames
-6. **Streams** the response back to Grok Bot
+找不到数据目录时，加 `--app-dir "实际数据目录"`。缺少 `gateway-descriptor.json` 但有旧导出文件时：
 
-Grok Bot doesn't know the proxy is there. It thinks it's talking to its
-normal backend. Grok Bot BYOK patches the host bundle (`host-main.cjs`)
-to redirect inference calls to `localhost:8788`, and a background watcher
-re-applies the patch automatically whenever Grok Bot updates itself.
+```powershell
+node .\export-grok-bot-session.cjs --include-backend --gateway-session "$env:USERPROFILE\grok-bot-session.json" --output "$env:USERPROFILE\grok-bot-session-with-backend.json"
+```
 
----
+输出文件必须尚不存在。凭证包含网关及账户访问令牌，私下传到服务器；失效后重新导出并替换，无需重启服务。
 
-## Quick start
+## Docker 部署
 
-### Prerequisites
-
-- Node.js 18+
-- A Grok Bot account
-- At least one LLM API key, or none at all. Kilo is keyless.
-
-### Install
+支持启动后通过网页上传凭证，也可在项目目录手动导入：
 
 ```bash
-# 1. Clone
-git clone https://github.com/jroth1111/grokbot-BYOK.git
-cd grokbot-BYOK
-
-# 2. One-command setup (installs deps, builds, patches Grok Bot, starts daemons)
-npm run setup -- --openrouter-key sk-or-xxx --opencode-key sk-xxx
-
-# Or with zero API keys (Kilo is keyless, works out of the box):
-npm run setup
+mkdir -p secrets
+install -m 600 grok-bot-session-with-backend.json secrets/grok-bot-session.json
+sudo chown 1000:1000 secrets secrets/grok-bot-session.json
+chmod 700 secrets
 ```
 
-Grok Bot's inference now routes through your providers.
+创建 `.env`（已有部署保留原值）：
 
-### Verifying it works
+```dotenv
+API_TOKEN=替换为长随机令牌
+UI_USERNAME=admin
+UI_PASSWORD=替换为管理员密码
+API_BIND_ADDRESS=127.0.0.1
+API_PORT=8789
+```
+
+局域网访问时将 `API_BIND_ADDRESS` 改为服务器局域网 IP。启动或更新：
 
 ```bash
-npm status                 # Check daemon status (all three should be "running")
-tail -20 /tmp/inference-shim.log  # Check the Grok Bot BYOK log for errors
-node dist/scripts/live-test.js    # Send a test request through Grok Bot BYOK
+docker compose up -d --build
+docker compose ps
+docker compose logs --tail=50 api
 ```
 
-If `npm status` shows all daemons running and the live test returns text,
-Grok Bot BYOK is working. If something failed, check
-[Troubleshooting](#troubleshooting).
+首次启动须创建 `secrets` 目录（`mkdir -p secrets`）；不必提前导入凭证。凭证目录只读挂载，网页导入的凭证和任务记录保存在 `video-data` 卷；不要用 `down -v` 删除记录。默认关闭聊天和官方 xAI 后端。
 
-### API keys
+## 视频 API
 
-Keys go in `.env` in the project root. You can pass them at setup time or
-edit `.env` manually. See [Providers](#providers) for which keys you need.
+网页登录后可直接使用视频接口，无需额外传 API Key。外部程序仍可使用 Bearer Token，或先登录 `/ui/login` 获取会话 Cookie；Cookie 登录及写操作须提供与服务地址一致的 `Origin` 请求头。
 
 ```bash
-# Via CLI flags (written to .env automatically)
-npm run setup -- --opencode-key sk-xxx --openrouter-key sk-or-xxx
-
-# Via env vars (written to .env automatically)
-OPENCODE_API_KEY=sk-xxx OPENROUTER_API_KEY=sk-or-xxx npm run setup
-
-# Or just edit .env directly
+BASE_URL=http://172.26.115.39:8789
+curl --fail-with-body -c cookies.txt "$BASE_URL/ui/login" \
+  -H "Origin: $BASE_URL" -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"你的管理员密码"}'
+curl --fail-with-body -b cookies.txt "$BASE_URL/v1/videos/generations" \
+  -H "Origin: $BASE_URL" -H 'Content-Type: application/json' \
+  -d '{"model":"grok-bot-video","prompt":"一只橘猫在花园里散步","duration":4,"aspect_ratio":"16:9","resolution":"720p"}'
 ```
 
-### What setup does
-
-The setup script is fully non-interactive and does everything in one step:
-
-1. Checks prerequisites (Node version, dependencies installed)
-2. Copies `config/config.example.json` to `config/config.json` (if not present)
-3. Copies `.env.example` to `.env` (if not present)
-4. Writes API keys from CLI flags / env vars into `.env`
-5. Builds Grok Bot BYOK + scripts (esbuild to standalone bundles)
-6. Starts three background daemons (see [Managing daemons](#managing-daemons))
-7. Patches Grok Bot's `host-main.cjs` to redirect inference to Grok Bot BYOK
-8. Runs a smoke test
-9. Exits 0 on success, 1 on failure
-
-Re-running `npm run setup` is safe. It stops existing daemons first, then
-restarts. It acts as a restart command too.
-
----
-
-## How it works
-
-### The request lifecycle
-
-Every inference request from Grok Bot follows this path through Grok Bot BYOK:
-
-```mermaid
-sequenceDiagram
-    participant C as Grok Bot
-    participant S as Grok Bot BYOK
-    participant P as Provider
-
-    C->>S: POST /Stream (Connect-RPC, binary)
-    S->>S: Parse Connect envelopes
-    S->>S: Translate to OpenAI ChatRequest
-    S->>S: Route to provider (priority/latency/round-robin)
-    S->>S: Vision check + budget guardrail
-    S->>P: POST /v1/chat/completions (OpenAI SSE)
-    alt Provider accepts
-        P-->>S: SSE chunks (text, tool calls, usage)
-        S-->>C: Connect frames (streamed)
-    else Provider rejects or stalls
-        S->>S: Failover to next provider
-        S->>P: Retry with next provider
-    end
-    S-->>C: End stream
-```
-
-<details>
-<summary>Detailed step-by-step lifecycle (click to expand)</summary>
-
-```
- 1. HTTP receive    Grok Bot POSTs a Connect-RPC streaming request to
-                    /aiserver.v1.InferenceService/Stream
- 2. Parse           Connect envelopes are decoded; the data frame is
-                    extracted as proto3 JSON (InferenceStreamRequest)
- 3. Translate       The Connect request is converted to an OpenAI
-                    ChatCompletion request (messages, tools, images,
-                    model config)
- 4. Route           The provider registry selects a provider based on
-                    the routing strategy and model id
- 5. Vision check    If the request has images but the model doesn't
-                    support vision, re-route to VISION_FALLBACK_MODEL
- 6. Budget check    Pre-flight token budget guardrail (optional)
- 7. Connect         Fetch the upstream provider (with retry/backoff,
-                    key rotation, circuit breaker checks)
- 8. Failover        If the provider rejects or stalls, try the next
-                    provider in the failover chain
- 9. Stream          Read the OpenAI SSE response, translate each chunk
-                    to Connect frames (text, tool calls, usage, thinking)
-10. Retry           If the stream produces no content (empty completion),
-                    failover to the next provider
-11. Respond         Write Connect frames back to Grok Bot
-```
-
-</details>
-
-Grok Bot BYOK writes nothing to the outbound response until a provider accepts
-the request, so failover between providers is transparent to Grok Bot.
-
-### The host patch
-
-> [!WARNING]
-> The setup script modifies Grok Bot's `host-main.cjs` in place. A backup
-> is saved as `host-main.cjs.bak` so `npm run uninstall` can restore it. If
-> you manually delete the backup, you'll need to re-download Grok Bot's
-> `host-main.cjs` to restore the original file.
-
-Grok Bot's inference client lives in a bundled file called `host-main.cjs`
-(in the `sand-host` directory). Grok Bot BYOK patches this file to:
-
-- Set the default model to your configured model
-- Replace the `createCursorInferencePromptSession` function with a
-  "routing client" that proxies all `.stream()` calls through the local
-  Grok Bot BYOK instance (reading the proxy URL from `inference-proxy.url`)
-
-A backup of the original file is saved as `host-main.cjs.bak` so the
-uninstall script can restore it.
-
-### The host watcher
-
-Grok Bot updates its own `host-main.cjs` periodically (on restart or
-update). A background watcher daemon monitors the file and re-applies the
-patch automatically when it changes. Grok Bot BYOK keeps working across
-Grok Bot updates without manual intervention.
-
----
-
-## Providers
-
-Grok Bot BYOK routes requests through providers in priority order with automatic
-failover. The registry skips providers with missing API keys automatically
-(except keyless ones).
-
-### Provider list
-
-| Provider | Env var | Required | Models | Description |
-|----------|---------|----------|--------|-------------|
-| `openrouter` | `OPENROUTER_API_KEY` | no | stealth/ox-alpha | OpenRouter gateway (many models behind one key) |
-| `opencode-go` | `OPENCODE_API_KEY` | yes | ox-alpha-free, qwen3.8-max (vision) | OpenCode Go endpoint. Frontier reasoning, free tier. |
-| `kilo` | `KILO_API_KEY` | no (keyless) | stealth/ox-alpha | Kilo gateway. 200 req/hr/IP without a key. |
-| `opencode-zen` | `OPENCODE_API_KEY` | no | x-preview-f-free | OpenCode Zen endpoint (shared key with Go) |
-| `local` | `LOCAL_API_KEY` | no | glm-5.2, glm-5.1, swe-1-7 | WindsurfAPI on localhost:3003 |
-
-**Default failover order.** `openrouter` then `opencode-go` then `kilo` then `opencode-zen` then `local`.
-
-### Where to get API keys
-
-| Provider | URL | Notes |
-|----------|-----|-------|
-| OpenCode | https://opencode.ai | One key works for both `opencode-go` and `opencode-zen` |
-| Kilo | https://kilo.ai | Optional. Anonymous access works without a key. |
-| OpenRouter | https://openrouter.ai/keys | Get a key at the keys page |
-| WindsurfAPI | Local | `LOCAL_API_KEY` must match `API_KEY` in WindsurfAPI/.env |
-
-### Where to put API keys
-
-All keys go in `.env` in the project root. Grok Bot BYOK sources `.env`
-automatically at startup. See `.env.example` for the full template.
+以下为 Bearer Token 的 Bash 示例。当前部署地址 `http://172.26.115.39:8789`；客户端令牌使用 `.env` 中的 `API_TOKEN`，不要使用桌面凭证里的 token。
 
 ```bash
-# .env
-OPENCODE_API_KEY=sk-your-opencode-key
-KILO_API_KEY=your-kilo-key          # optional (keyless works without this)
-OPENROUTER_API_KEY=sk-or-v1-your-key
-LOCAL_API_KEY=sk-local-test         # must match WindsurfAPI's API_KEY
+BASE_URL=http://172.26.115.39:8789
+export API_TOKEN='你的客户端令牌'
+
+curl -sS "$BASE_URL/healthz"
+curl -sS "$BASE_URL/v1/models" -H "Authorization: Bearer $API_TOKEN"
+curl -sS "$BASE_URL/v1/auth/status" -H "Authorization: Bearer $API_TOKEN"
 ```
 
-String values in `config/config.json` support `${ENV_VAR}` interpolation, so
-the config references keys by env var name.
+`/v1/models` 的 `data` 包含 `{"id":"grok-bot-video","object":"model","created":0,"owned_by":"grok-bot-task-adapter"}`。检查云电脑连接可请求 `/v1/bots`，认证方式相同。
 
-> [!TIP]
-> No secrets go in the config file. All API keys live in `.env` and are
-> referenced via `${VAR_NAME}` interpolation in `config.json`. This keeps
-> secrets out of git.
+### 创建视频
 
----
+```bash
+curl --fail-with-body "$BASE_URL/v1/videos" \
+  -H "Authorization: Bearer $API_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"grok-bot-video","prompt":"一只橘猫在花园里散步，镜头缓缓推进","seconds":"4","size":"1280x720"}'
+```
 
-## Configuration
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `model` | string | 默认 `grok-bot-video` |
+| `prompt` | string | 必填，1–32000 字符 |
+| `seconds` | string | `"4"`、`"8"`、`"12"`，默认 `"4"` |
+| `size` | string | `1280x720`、`720x1280`，默认前者 |
+| `input_reference` | object | 单图/起始图：`{"image_url":"图片地址"}` |
+| `reference_images` | array | 多参考图：`[{"url":"图片地址"}]`，1–8 张 |
+| `last_frame` | object | 尾帧：`{"url":"图片地址"}` |
+| `keyframes` | array | 关键帧：`[{"url":"图片地址","timestamp_seconds":1}]`，1–16 帧 |
 
-Config is a single JSON file (`config/config.json`), validated by a zod
-schema at startup. Copy `config/config.example.json` to get started.
+所有图片地址支持 HTTPS 或 `data:image/png;base64,...`，Base64 同时支持 JPEG、WebP，不接受裸 Base64。单图片地址最多 16 MiB 字符，整个请求最多 20 MiB（包含 Base64 膨胀）。关键帧时间不能重复，范围为 0 至请求时长，提交时自动按时间排序。多图参数请使用 JSON 请求。
+
+`reference_images`、`last_frame`、`keyframes` 是本项目扩展字段，两种接口都支持；数量限制由适配器设置，不代表模型上限。它们分别映射到 Bot 工具的 `reference_image_paths`、`last_frame_path`、`keyframes`。接入与参数映射已自动测试，上游多图/尾帧/关键帧生成效果尚未实测；实际支持取决于 Bot 的工具和权限，不会主动降级成拼图或单图。
+
+多参考图示例（也可按需组合起始图、尾帧和关键帧）：
 
 ```json
 {
-  "port": 8788,
-  "host": "127.0.0.1",
-  "failover": true,
-  "requestTimeoutMs": 30000,
-  "routingStrategy": "latency",
-  "sessionAffinity": { "enabled": false, "ttlMs": 3600000 },
-  "providers": {
-    "priority": ["openrouter", "opencode-go", "kilo", "opencode-zen", "local"],
-    "configs": { ... }
-  },
-  "hostConfig": {
-    "sandHostDir": "${SAND_HOST_DIR}",
-    "defaultModel": "Ox Alpha Free"
-  }
+  "model": "grok-bot-video",
+  "prompt": "人物参考第一张，服装参考第二张，人物在花园里行走",
+  "seconds": "4",
+  "reference_images": [
+    {"url": "https://example.com/character.png"},
+    {"url": "data:image/jpeg;base64,替换为完整Base64"}
+  ]
 }
 ```
 
-### Per-provider configuration
-
-Each provider in `configs` supports:
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `baseUrl` | string (URL) | The OpenAI-compatible API endpoint |
-| `apiKey` | string | `${ENV_VAR}` reference (resolved from `.env`) |
-| `keys` | array | Multiple keys for rotation (optional; see below) |
-| `defaultModel` | string | Fallback model when no alias matches |
-| `models` | object | Alias to canonical model id map (case-insensitive) |
-| `network` | object | Per-provider retry/timeout/circuit config (see below) |
-| `compat` | object | Per-provider compat flag overrides (optional) |
-| `keyless` | boolean | Include in routing even if apiKey is empty |
-
-### Network configuration (per provider)
-
-| Field | Default | Description |
-|-------|---------|-------------|
-| `requestTimeoutMs` | 30000 | HTTP request timeout (ms) |
-| `maxRetries` | 0 | Retries within this provider before failing over |
-| `retryBackoffInitialMs` | 500 | Initial exponential backoff (ms) |
-| `retryBackoffMaxMs` | 5000 | Backoff cap (ms) |
-| `streamIdleTimeoutMs` | 120000 | Close stream if no data for this long (ms) |
-| `ttfbTimeoutMs` | 15000 | Abort and failover if no first token within this (ms; 0 disables) |
-| `rateLimitCooldownMs` | 10000 | Circuit cooldown after 429 (ms) |
-| `serverErrorCooldownMs` | 30000 | Circuit cooldown after 5xx (ms) |
-| `failureThreshold` | 3 | Consecutive failures before circuit opens |
-
-### Multiple API keys (key rotation)
-
-A provider can hold multiple keys for load distribution and failover:
+首尾帧与关键帧参数示例，添加到创建请求中：
 
 ```json
 {
-  "openrouter": {
-    "baseUrl": "https://openrouter.ai/api/v1",
-    "keys": [
-      { "value": "${OPENROUTER_KEY_1}", "weight": 2 },
-      { "value": "${OPENROUTER_KEY_2}", "weight": 1 }
-    ],
-    "defaultModel": "stealth/ox-alpha",
-    "models": { ... }
-  }
+  "input_reference": {"image_url": "https://example.com/start.png"},
+  "last_frame": {"url": "https://example.com/end.png"},
+  "keyframes": [
+    {"url": "https://example.com/middle.png", "timestamp_seconds": 2}
+  ]
 }
 ```
 
-Keys rotate round-robin. A key that returns 401/403 is marked failed and
-removed from rotation. When all keys fail, the set resets so they get
-another chance.
-
-### Environment variables
-
-<details>
-<summary>Full env var reference (click to expand)</summary>
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `OPENCODE_API_KEY` | none | OpenCode Go + Zen API key |
-| `KILO_API_KEY` | none | Kilo gateway key (optional, keyless works without it) |
-| `OPENROUTER_API_KEY` | none | OpenRouter API key |
-| `LOCAL_API_KEY` | `sk-local-test` | Must match WindsurfAPI's `API_KEY` |
-| `WINDSURF_API_KEY` | none | Override Devin session token (auto-read from credentials.toml if unset) |
-| `DROUGHT_RESTRICT_PREMIUM` | `0` | Disable WindsurfAPI's stale premium gate |
-| `VISION_FALLBACK_MODEL` | `qwen3.8-max` | Re-route image requests to this vision-capable model |
-| `SHIM_PORT` | `8788` | Override listen port |
-| `SHIM_HOST` | `127.0.0.1` | Override listen host |
-| `SHIM_FAILOVER` | `true` | Set to `0` to disable provider failover |
-| `SHIM_LOG_DIR` | none | Directory for tool-schema dumps (empty = disabled) |
-| `SAND_HOST_DIR` | `$HOME/sand-host` | Grok Bot sand-host directory (where host-main.cjs lives) |
-| `CAPTURE_BODIES` | `false` | Log request/response bodies for debugging |
-| `REQUEST_MAX_TOKENS_BUDGET` | `0` (off) | Per-request token cost ceiling |
-| `MAX_CONSECUTIVE_UPSTREAM_FAILS` | `0` (off) | Stop failover after N consecutive failures |
-| `VALIDATE_TOOL_ARGUMENTS` | `false` | Validate tool call args against schemas |
-
-</details>
-
-> [!NOTE]
-> **WindsurfAPI** is a local LLM server that runs on `127.0.0.1:3003`. It
-> serves GLM and SWE models using the Devin CLI's session token for auth.
-> The `local` provider in the default config points at it. If you don't
-> have WindsurfAPI installed, Grok Bot BYOK still works with the other
-> providers. The `start-shim` launcher tries to auto-start WindsurfAPI
-> from `../WindsurfAPI` if the local provider is configured and nothing
-> is listening on port 3003.
-
----
-
-## Managing daemons
+单张本地图片也可以 multipart 上传：
 
 ```bash
-npm run setup              # Start/restart everything (builds, stops old, starts new)
-npm run setup -- --status  # Check daemon status (exit 0 if all running, 1 if not)
-npm run setup -- --stop    # Stop all daemons
-npm run setup -- --no-build # Restart without rebuilding (same as npm start)
-npm run setup -- --no-watch # Start without host watcher
-npm run setup -- --quiet   # Minimal output (agent-friendly)
-npm start                  # Start/restart all daemons (no rebuild, re-patches host)
-npm stop                   # Stop all daemons
-npm status                 # Check daemon status
+curl --fail-with-body "$BASE_URL/v1/videos" \
+  -H "Authorization: Bearer $API_TOKEN" \
+  -F 'prompt=让图片中的人物自然转头' -F seconds=4 \
+  -F 'input_reference=@./start.png;type=image/png'
 ```
 
-### Daemon processes
-
-| Daemon | PID file | Log file | Purpose |
-|--------|----------|----------|---------|
-| Grok Bot BYOK | `/tmp/inference-shim.pid` | `/tmp/inference-shim.log` | The inference proxy itself (port 8788) |
-| Host watcher | `/tmp/grokbot-watch-host.pid` | `/tmp/grokbot-watch-host.log` | Re-patches Grok Bot's host bundle when it updates |
-| Health watchdog | `/tmp/grokbot-health-check.pid` | `/tmp/grokbot-health-check.log` | Monitors Grok Bot BYOK health, auto-redeploys on failure |
-
-The host watcher is what makes re-attachment robust. When Grok Bot's
-supervisor updates or reinstalls `host-main.cjs`, the watcher detects the
-change, re-applies the routing-client patch, and restarts the host process.
-This happens automatically. No manual intervention needed after Grok Bot
-updates.
-
-The health watchdog parses Grok Bot BYOK's log to compute an error rate over a
-rolling 5-minute window. If the error rate exceeds 50%, it runs the deploy
-script to rebuild and restart. A deploy cooldown (5 minutes) prevents
-deploy storms.
-
-### Checking logs
-
-```bash
-tail -f /tmp/inference-shim.log        # Live shim log (requests, routing, errors)
-tail -f /tmp/grokbot-watch-host.log    # Host watcher log (patch events)
-tail -f /tmp/grokbot-health-check.log  # Health watchdog log (health status)
-```
-
-All logs are JSON lines. Pipe through `jq` for readable output:
-
-```bash
-tail -100 /tmp/inference-shim.log | jq 'select(.level=="error")'
-```
-
----
-
-## Uninstall
-
-```bash
-# Stop daemons, remove PID/log files, restore Grok Bot's host-main.cjs
-npm run uninstall
-
-# Full removal: also delete .env, config.json, dist/, node_modules/
-npm run uninstall -- --purge
-
-# Quiet mode (agent-friendly)
-npm run uninstall -- --quiet
-
-# Leave the host patch in place (don't restore host-main.cjs)
-npm run uninstall -- --keep-host
-```
-
-The uninstall script:
-- Stops all three daemons (Grok Bot BYOK, host watcher, health watchdog)
-- Removes all PID files and log files from `/tmp/`
-- Restores Grok Bot's `host-main.cjs` from the `.bak` backup (if one exists)
-- Removes the `inference-proxy.url` file and deployed Grok Bot BYOK symlink
-- With `--purge`: also removes `.env`, `config/config.json`, `dist/`, `node_modules/`
-- The git repository itself is preserved. Delete the directory manually if needed.
-
----
-
-## Routing strategies
-
-Set `routingStrategy` in `config/config.json`:
-
-| Strategy | Behavior |
-|----------|----------|
-| `priority` | First provider (in priority order) that can handle the model wins. All traffic goes to the highest-priority provider until it fails. |
-| `latency` | Routes to the provider with the best combined TTFB + throughput score. Uses epsilon-greedy exploration and shadow probes to keep scores fresh. Recommended. |
-| `round-robin` | Rotates through providers that can handle the model in round-robin fashion. |
-| `weighted-round-robin` | Smooth weighted round-robin (SWRR) using each provider's first key weight. |
-| `fill-first` | Same as `priority`. |
-
-If no provider claims the model id, the first provider in the priority list
-is used as the default fallback.
-
----
-
-## Failover and circuit breaking
-
-When `failover: true` (default), Grok Bot BYOK tries providers in priority order
-until one succeeds. Each provider has an independent circuit breaker:
-
-```mermaid
-stateDiagram-v2
-    [*] --> Closed
-    Closed --> Open: 3 consecutive failures
-    Open --> HalfOpen: cooldown elapsed
-    HalfOpen --> Closed: probe succeeds
-    HalfOpen --> Open: probe fails
-    Open --> Open: cooldown not elapsed
-```
-
-The circuit states:
-
-- After 3 consecutive failures (configurable via `failureThreshold`), the
-  circuit opens and the provider is skipped
-- After the cooldown elapses (10s for rate limits, 30s for server errors),
-  one half-open probe is allowed
-- If the probe succeeds, the circuit closes
-- If the probe fails, the circuit stays open for another cooldown period
-
-Error classification determines whether to retry, failover, or stop:
-
-| Error type | HTTP status | Action |
-|------------|-------------|--------|
-| `request-error` | 400, 404, 405, 413, 422 | Stop. Will fail on every provider. |
-| `auth-error` | 401, 402, 403 | Rotate key, then failover |
-| `rate-limit` | 429 | Retry with backoff, then failover |
-| `server-error` | 5xx | Retry with backoff, then failover |
-| `network-error` | timeout, connection reset | Retry with backoff, then failover |
-| `empty-completion` | 200 but no content | Failover to next provider |
-| `invalid-tool-arguments` | 200 but bad tool calls | Failover to next provider |
-
-### Cross-provider failover on empty completion
-
-If a provider returns a 200 response but produces no content (empty
-completion), Grok Bot BYOK fails over to the next provider instead of returning
-an empty response. This handles providers that accept the request but
-silently produce nothing, a common failure mode for free-tier endpoints.
-
-If the client disconnects during a stream, the failover loop stops
-immediately. No point burning upstream provider quota on a response no one
-will receive.
-
----
-
-## Latency-based routing
-
-When `routingStrategy: "latency"`, Grok Bot BYOK maintains per-provider
-performance scores using exponentially-weighted moving averages (EWMA) of
-three signals:
-
-- **Prefill speed.** TTFB divided by prompt tokens (ms per prompt token).
-- **Decode speed.** Completion tokens divided by generation duration (tokens/sec).
-- **Error rate.** Fraction of failed requests.
-
-The combined score projects each provider's rates onto a reference workload
-(rolling average of actual request sizes) to answer one question: "If I
-sent my average-sized request to each provider, which would finish first?"
-
-```
-score = (prefillMsPerPromptToken × refPromptTokens
-       + 1000 / tokensPerSec × refCompletionTokens)
-       × (1 + errorRate × 0.2)
-       × stalenessDecay
-```
-
-Lower is better. Four things keep the scores honest:
-
-- **Epsilon-greedy exploration.** 10% of requests go to a random provider
-  to keep scores fresh and discover faster providers.
-- **Shadow probes.** Every 50th request, a concurrent probe goes to the
-  second-best provider to calibrate scores with apples-to-apples data.
-- **Staleness decay.** Providers with old data get a reduced score to
-  encourage re-sampling.
-- **Client-disconnect awareness.** Client-side aborts don't count as
-  provider failures, so error rates stay clean.
-
----
-
-## Session affinity
-
-When `sessionAffinity.enabled: true`, Grok Bot BYOK binds a session ID (derived
-from the request's `invocationId`) to a provider so subsequent requests from
-the same conversation go to the same provider. This preserves server-side
-prompt caching and conversation continuity.
-
-Bindings expire after `ttlMs` (default: 1 hour). A cleanup sweep runs
-every 5 minutes.
-
----
-
-## Vision fallback
-
-When a request contains images but the resolved model doesn't support
-vision, Grok Bot BYOK re-routes to `VISION_FALLBACK_MODEL` (default:
-`qwen3.8-max`) instead of silently stripping the images. If no fallback
-model is configured, Grok Bot BYOK replaces images with a placeholder text and
-sends the request to the original model.
-
-Vision support is auto-detected per model based on the model id and provider
-(see `detectSupportsImages` in `src/providers/compat.ts`).
-
----
-
-## Tool call handling
-
-Grok Bot BYOK handles tool calls across the Connect to OpenAI translation
-boundary:
-
-- **Tool call accumulation.** OpenAI streams tool calls as deltas spread
-  across multiple SSE chunks. The accumulator merges them into complete
-  tool calls and emits them as Connect `toolCallPart` frames.
-- **Argument repair.** Streaming JSON arguments that are split mid-token are
-  repaired using a streaming JSON parser.
-- **Inline tool-call rescue.** When a model emits tool calls as text in a
-  non-standard dialect (Kimi `<|tool_call_begin|>`, DeepSeek DSML, Qwen
-  `<tool_calls>` XML), Grok Bot BYOK detects and re-parses them into structured
-  tool calls.
-- **Markup healing.** A streaming filter strips leaked chat-template markup
-  from visible content and reconstructs tool calls and reasoning from it.
-- **Schema validation** (optional, `VALIDATE_TOOL_ARGUMENTS=true`). Validates
-  flushed tool calls against their JSON schemas. Definite violations trigger
-  failover to the next provider.
-
----
-
-## Observability
-
-### Structured logging
-
-All logs are JSON lines with a timestamp, level, message, and structured
-fields. Every request gets a unique `requestId` injected into all log lines
-for that request, so you can trace a single request through the full
-lifecycle.
-
-### Credential redaction
-
-API keys are redacted from all log output at the console level. No
-`sk-*`, `gsk_*`, `AIza*`, Bearer token, or JWT ever reaches stdout, even
-from code that hasn't been written yet.
-
-### Metrics
-
-Grok Bot BYOK logs per-provider metrics every 5 minutes:
+创建返回 HTTP 200，主要字段：
 
 ```json
-{"msg":"provider metrics","provider":"openrouter","requests":16,
- "successes":16,"errors":0,"errorRate":0,"avgLatencyMs":33962,
- "avgTtfbMs":13754,"latencyHistogram":{...}}
+{"id":"video_…","object":"video","model":"grok-bot-video","status":"queued","progress":0,"seconds":"4","size":"1280x720","backend":"grok_bot_task","generation_tool_verified":false,"error":null}
 ```
 
-When `routingStrategy: "latency"`, it also logs per-provider performance
-scores:
+### 查询与下载
+
+保存创建返回的 `id`，每 2–5 秒查询一次：
+
+```bash
+VIDEO_ID=替换为返回的id
+curl -sS "$BASE_URL/v1/videos/$VIDEO_ID" -H "Authorization: Bearer $API_TOKEN"
+```
+
+状态为 `queued`、`in_progress`、`completed`、`failed`，失败原因在 `error` 中。完成时主要字段：
 
 ```json
-{"msg":"provider performance","provider":"openrouter","samples":16,
- "avgPrefillMsPerPromptToken":0.12,"avgTokensPerSec":89.2,
- "errorRate":0.0,"score":1234.56,"ageMs":5000,
- "refPromptTokens":10000,"refCompletionTokens":500}
+{"id":"video_…","status":"completed","progress":100,"error":null,"video":{"url":"/v1/videos/video_…/content"}}
 ```
 
-### Body capture (debug)
-
-Set `CAPTURE_BODIES=true` to log truncated request/response bodies for
-debugging. Bodies are truncated to `CAPTURE_MAX_BYTES` (default 4096).
-Tool-call arguments are NOT redacted. This is a debugging tool, not a
-production log.
-
-### Process safety net
-
-A process-level safety net catches unhandled errors and rejections.
-Transient transport errors (ECONNRESET, UND_ERR_SOCKET) are swallowed. A
-CDN edge resetting a socket must never crash the process. Everything else
-(programming bugs) stays fatal (exit 1) to surface loudly.
-
----
-
-## Guardrails
-
-Two optional hard limits, both off by default:
-
-1. **Token budget** (`REQUEST_MAX_TOKENS_BUDGET`). Pre-flight check that
-   estimated input plus requested output fits within a per-request token
-   ceiling. Oversized requests get a 413 before any provider is tried.
-   Requests without an explicit `max_tokens` have their output capped to
-   the budget remainder instead of being rejected.
-
-2. **Consecutive failure breaker** (`MAX_CONSECUTIVE_UPSTREAM_FAILS`). Stops
-   the failover chain after N consecutive upstream failures, returning a 503
-   instead of grinding through a pool that's failing across the board.
-
----
-
-## Deploy
-
-> [!IMPORTANT]
-> You rarely need to run deploy manually. Use `npm run setup` for normal
-> restarts. The health watchdog calls deploy automatically when Grok Bot BYOK's
-> error rate exceeds 50%.
-
-For advanced deployment (atomic rebuild with symlink swap and host restart):
+下载 MP4，支持 HTTP Range：
 
 ```bash
-# Full deploy: typecheck, build, stop old, symlink, start, patch host, test
-node dist/scripts/deploy.js
-
-# Copy instead of symlink
-node dist/scripts/deploy.js --copy
-
-# Skip host restart
-node dist/scripts/deploy.js --no-restart
+curl --fail-with-body "$BASE_URL/v1/videos/$VIDEO_ID/content" \
+  -H "Authorization: Bearer $API_TOKEN" -o result.mp4
 ```
 
-The health watchdog calls this script automatically when Grok Bot BYOK's error
-rate exceeds 50%. You rarely need to run it manually. Use `npm run setup`
-for normal restarts instead.
-
----
-
-## Troubleshooting
-
-### Setup failed
-
-Check the setup output for the specific error. Common causes:
-
-- **Missing API keys.** The setup script exits with a message showing which
-  keys are needed and how to provide them. Kilo is keyless, so `npm run
-  setup` with no keys still works.
-- **Node version too old.** Requires Node 18+. Check with `node --version`.
-- **Port 8788 in use.** Another process is holding the port. Stop it or set
-  `SHIM_PORT` to a different value in `.env`.
-- **Grok Bot not found.** The setup script looks for `host-main.cjs` in
-  `$HOME/sand-host`. If your Grok Bot `host-main.cjs` is in a different
-  location, set `SAND_HOST_DIR` in `.env`.
-
-### Grok Bot's inference stopped working
+获取浏览器可打开的 15 分钟免请求头链接：
 
 ```bash
-npm status                                    # Are the daemons running?
-tail -50 /tmp/inference-shim.log | jq 'select(.level=="error")'  # Any errors?
+curl -sS "$BASE_URL/v1/videos/$VIDEO_ID/download-url" -H "Authorization: Bearer $API_TOKEN"
 ```
 
-If Grok Bot BYOK crashed, the health watchdog should auto-redeploy within 5
-minutes. If it didn't, run `npm run setup` to restart everything.
+返回 `{"url":"/v1/videos/video_…/content?expires=…&signature=…","expires_at":1793150000}`，将相对 `url` 拼到 `BASE_URL` 后即可打开。下载仍依赖上游文件可访问。
 
-If the host patch was lost (Grok Bot updated and the watcher didn't catch
-it), run `npm run setup` to re-patch.
+获取上游存储签名链接：`GET /v1/videos/{id}/source-url`，认证方式相同。成功返回 `{"url":"https://…","expires_at":1793150000,"size":4541524,"content_type":"video/mp4"}`。附件未进入存储时返回 404 `source_url_unavailable`，可尝试本服务下载接口。
 
-### All providers failing
+### xAI 风格入口
 
 ```bash
-tail -100 /tmp/inference-shim.log | jq 'select(.msg=="all providers failed")'
+curl --fail-with-body "$BASE_URL/v1/videos/generations" \
+  -H "Authorization: Bearer $API_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"grok-bot-video","prompt":"让人物自然转头","duration":4,"aspect_ratio":"16:9","resolution":"720p","image":{"url":"https://example.com/start.png"}}'
 ```
 
-Check which providers are in the failover chain and whether their API keys
-are valid. A 401/403 means the key is bad. A 429 means rate limited (wait
-for the cooldown). A 5xx means the provider is down (the circuit breaker
-will skip it after 3 failures).
+| 字段 | 说明 |
+|---|---|
+| `model`、`prompt` | 与上述接口相同 |
+| `duration` | 整数 1–15，默认 4 |
+| `aspect_ratio` | `1:1`、`16:9`、`9:16`、`4:3`、`3:4`、`3:2`、`2:3`，默认 `16:9` |
+| `resolution` | `480p`、`720p`、`1080p`，默认 `720p` |
+| `image` | 起始图：`{"url":"HTTPS地址或Base64 Data URL"}` |
+| `reference_images`、`last_frame`、`keyframes` | 与上述扩展字段相同 |
 
-### Provider not in the failover chain
+创建返回 `{"request_id":"video_…"}`。使用 `/v1/videos/{request_id}` 查询，状态为 `pending`、`done`、`failed`；完成返回 `video.url`，失败返回 `error`。下载接口与上述相同。
 
-The registry skips providers whose API key is empty or unresolved (the
-`${VAR}` literal remains because the env var isn't set). Check that the
-key exists in `.env` and that the env var name in `config.json` matches.
+### 常见问题
 
-### Grok Bot BYOK is running but Grok Bot doesn't use it
+- `401 unauthorized`：检查客户端 `API_TOKEN`。
+- `503 desktop_asleep`：在桌面端连接并唤醒云电脑，再查询已有任务。
+- 凭证缺失/失效：重新导出并替换 `secrets/grok-bot-session.json`，确认 UID 1000 可读。
+- `409 video_not_ready`：等待任务完成。
+- `submission_uncertain`：可能已提交，先检查桌面 Bot，避免重复生成。
 
-The host patch may have been lost. Verify:
-
-```bash
-# Check if the proxy URL file exists
-ls -la $HOME/sand-host/inference-proxy.url
-
-# Check if host-main.cjs has the routing client patch
-grep -c "routingClient" $HOME/sand-host/host-main.cjs
-```
-
-If either is missing, run `npm run setup` to re-patch.
-
----
-
-## Tests
-
-```bash
-npm test              # Run all 359 tests
-npm run test:watch    # Watch mode
-npm run typecheck     # Type check only (tsc --noEmit)
-```
-
-The test suite covers:
-- Protocol encoding/decoding (Connect envelopes, edge cases)
-- Request/response translation (Connect to OpenAI and back)
-- Provider routing (priority, latency, round-robin, weighted)
-- Circuit breaker and failover logic
-- Retry with backoff
-- Session affinity
-- Stream timeout handling
-- Performance tracker scoring (EWMA, sentinel handling, staleness)
-- Server integration (full HTTP lifecycle with mock upstreams)
-- End-to-end (real Grok Bot BYOK server, real HTTP requests)
-- Client-disconnect failover behavior
-- Config validation
-
----
-
-## Build
-
-```bash
-npm run build         # Build Grok Bot BYOK only (dist/shim.js)
-npm run build:all     # Build Grok Bot BYOK + scripts (dist/shim.js + dist/scripts/*.js)
-npm run clean         # Remove dist/
-```
-
-The build uses esbuild to produce standalone bundled `.js` files with no
-runtime dependencies (except `ajv` and `zod`, which are bundled in).
-Grok Bot BYOK is a single `dist/shim.js` file that can run anywhere Node 18+ is
-available.
-
----
-
-## Project structure
-
-<details>
-<summary>Full file tree (click to expand)</summary>
-
-```
-src/
-  shim.ts                       Entry point (PID lock, startup, shutdown)
-  server.ts                     HTTP server, the request lifecycle
-  config.ts + config/schema.ts  Config loader + zod validation
-  log.ts                        Structured JSON logger
-  types.ts                      Shared types (Provider, ShimConfig, etc.)
-  protocol/                     Connect-RPC codec, SSE parser, proto3 helpers
-  translate/                    Connect to OpenAI translation (request, response,
-                                tools, vision, think-tags, markup healing)
-  providers/                    Provider registry, routing, circuit breaker,
-                                retry, latency scoring, session affinity
-  observability/                Metrics, logging, error classification,
-                                guardrails, credential redaction
-  utils/                        Daemon management, .env loader, JSON repair
-scripts/
-  setup.ts                      One-command setup
-  start-shim.ts                 Grok Bot BYOK launcher (WindsurfAPI auto-start)
-  deploy.ts                     Atomic deploy (build, symlink, restart)
-  patch-host.ts                 Host bundle patcher
-  watch-host.ts                 Bundle watcher (auto re-patch)
-  health-check.ts               Health watchdog (auto-deploy on failure)
-  uninstall.ts                  Uninstall
-config/
-  config.example.json           Example config with all providers
-test/
-  13 test files, 359 tests
-```
-
-</details>
-
----
-
-## License
-
-MIT
+这些是部分 OpenAI/xAI 格式兼容接口，模型 ID 表示 Bot 任务适配器。生成参数是请求要求；实际模型、分辨率与图片控制效果由 Bot 决定。`generation_tool_verified:false` 表示记录中未公开可核验的工具调用。当前不提供视频编辑、延长或重混。

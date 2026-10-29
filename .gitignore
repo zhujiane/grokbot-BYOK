@@ -8,3 +8,10 @@ config/config.json
 inference-proxy.url
 *.pid
 windsurfapi.log
+data/video-jobs/
+secrets/
+grok-bot-session*.json
+research/
+app.asar/
+*.asar
+data/desktop-jobs/

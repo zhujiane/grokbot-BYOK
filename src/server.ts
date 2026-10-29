@@ -16,6 +16,8 @@
 import * as http from "node:http";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { createVideoHandler } from "./video/api.js";
+import { createRestHandler } from "./rest/api.js";
 import type {
   ConnectEnvelope,
   InferenceStreamRequest,
@@ -482,11 +484,13 @@ async function shadowProbe(
  * the lifetime of the server.
  */
 export function createServer(config: ShimConfig, baseLogger: Logger): http.Server {
+  const handleVideo = createVideoHandler(config.video, baseLogger);
   const registry = new ProviderRegistry(
     config.providers.configs,
     config.providers.priority,
     config.routingStrategy,
   );
+  const handleRest = createRestHandler(config, registry);
   const breaker = new CircuitBreaker();
   const sessionAffinity = new SessionAffinity(config.sessionAffinity);
 
@@ -523,6 +527,8 @@ export function createServer(config: ShimConfig, baseLogger: Logger): http.Serve
   metricsHandle.unref();
 
   const server = http.createServer(async (req, res) => {
+    if (await handleRest(req, res)) return;
+    if (await handleVideo(req, res)) return;
     // Only the streaming inference path is supported.
     if (req.method !== "POST" || req.url !== STREAM_PATH) {
       res.writeHead(404, { "Content-Type": "text/plain" });

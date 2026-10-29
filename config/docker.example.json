@@ -1,0 +1,32 @@
+{
+  "port": 8788,
+  "host": "0.0.0.0",
+  "api": {
+    "enabled": true,
+    "apiToken": "${API_TOKEN}",
+    "allowConnect": false,
+    "maxBodyBytes": 2097152
+  },
+  "grokBot": {
+    "enabled": true,
+    "credentialsFile": "/app/secrets/grok-bot-session.json",
+    "requestTimeoutMs": 30000,
+    "videoEnabled": true,
+    "chatEnabled": false,
+    "jobsDir": "/app/data/desktop-jobs",
+    "jobTimeoutMs": 1800000,
+    "chatTimeoutMs": 120000,
+    "pollIntervalMs": 2000,
+    "maxConcurrentJobs": 4
+  },
+  "video": {
+    "enabled": false,
+    "jobsDir": "/app/data/video-jobs"
+  },
+  "providers": {
+    "priority": [],
+    "configs": {}
+  },
+  "sessionAffinity": { "enabled": false },
+  "hostConfig": { "sandHostDir": "", "defaultModel": "" }
+}

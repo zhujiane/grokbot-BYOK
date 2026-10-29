@@ -1,0 +1,28 @@
+services:
+  api:
+    build: .
+    image: grokbot-byok:local
+    restart: unless-stopped
+    init: true
+    environment:
+      API_TOKEN: ${API_TOKEN:?Set API_TOKEN in .env}
+      UI_USERNAME: ${UI_USERNAME:-admin}
+      UI_PASSWORD: ${UI_PASSWORD:?Set UI_PASSWORD in .env}
+      SHIM_HOST: 0.0.0.0
+      SHIM_PORT: 8788
+    ports:
+      - "${API_BIND_ADDRESS:-127.0.0.1}:${API_PORT:-8788}:8788"
+    volumes:
+      - type: bind
+        source: ${GROK_BOT_SECRETS_DIR:-./secrets}
+        target: /app/secrets
+        read_only: true
+        bind:
+          create_host_path: false
+      - video-data:/app/data
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+volumes:
+  video-data:

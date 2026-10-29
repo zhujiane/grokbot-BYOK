@@ -1,6 +1,16 @@
 {
   "port": 8788,
   "host": "127.0.0.1",
+  "video": {
+    "enabled": false,
+    "baseUrl": "https://api.x.ai/v1",
+    "apiKey": "${XAI_API_KEY}",
+    "apiToken": "${VIDEO_API_TOKEN}",
+    "defaultModel": "grok-imagine-video",
+    "jobsDir": "data/video-jobs",
+    "requestTimeoutMs": 60000,
+    "maxBodyBytes": 20971520
+  },
   "logDir": "",
   "failover": true,
   "requestTimeoutMs": 30000,

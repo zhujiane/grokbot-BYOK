@@ -1,0 +1,11 @@
+*
+!Dockerfile
+!package.json
+!package-lock.json
+!src/
+!src/**
+!config/
+!config/docker.example.json
+
+!scripts/
+!scripts/export-grok-bot-session.cjs

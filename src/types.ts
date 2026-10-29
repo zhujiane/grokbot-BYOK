@@ -325,6 +325,26 @@ export interface SessionAffinityConfig {
 }
 
 export interface ShimConfig {
+  api?: {
+    enabled?: boolean;
+    apiToken?: string;
+    allowConnect?: boolean;
+    maxBodyBytes?: number;
+  };
+  grokBot?: {
+    enabled?: boolean;
+    credentialsFile?: string;
+    requestTimeoutMs?: number;
+    videoEnabled?: boolean;
+    chatEnabled?: boolean;
+    jobsDir?: string;
+    jobTimeoutMs?: number;
+    chatTimeoutMs?: number;
+    pollIntervalMs?: number;
+    maxConcurrentJobs?: number;
+  };
+  /** Optional Grok video generation API, independent of chat providers. */
+  video?: VideoConfig;
   port: number;
   host: string;
   logDir: string;
@@ -349,6 +369,17 @@ export interface ShimConfig {
     sandHostDir: string;
     defaultModel: string;
   };
+}
+
+export interface VideoConfig {
+  enabled?: boolean;
+  baseUrl?: string;
+  apiKey?: string;
+  apiToken?: string;
+  defaultModel?: string;
+  jobsDir?: string;
+  requestTimeoutMs?: number;
+  maxBodyBytes?: number;
 }
 
 // ---------------------------------------------------------------------------
