@@ -98,37 +98,42 @@ export function createRestHandler(config: ShimConfig, registry: ProviderRegistry
         if (source) return source;
       }
     }
-    const descriptor = await session(); // Re-read on every call so re-export needs no restart.
-    const headers: Record<string, string> = {};
-    for (const [name, value] of Object.entries(descriptor.headers)) {
-      if (name.toLowerCase().startsWith("x-") && !/[\r\n]/.test(name + value)) headers[name] = value;
+    for (let attempt = 0; ; attempt++) {
+      const descriptor = await session(); // Re-read on every call so re-export needs no restart.
+      const headers: Record<string, string> = {};
+      for (const [name, value] of Object.entries(descriptor.headers)) {
+        if (name.toLowerCase().startsWith("x-") && !/[\r\n]/.test(name + value)) headers[name] = value;
+      }
+      headers["Content-Type"] = "application/json";
+      headers.Authorization = `Bearer ${descriptor.gatewayToken}`;
+      const response = await fetch(`${descriptor.gatewayUrl.replace(/\/+$/, "")}/api/${method}`, {
+        method: "POST", headers, body: JSON.stringify(body), redirect: "error",
+        signal: AbortSignal.timeout(config.grokBot?.requestTimeoutMs ?? 30000),
+      });
+      if (!response.ok) {
+        await response.body?.cancel();
+        // HTTP 417 means the cloud computer hibernated. Wake it through the account backend and
+        // retry once, so no desktop app is needed. The job layer must never blindly resend.
+        if (response.status === 417 && attempt === 0 && await media.wake()) continue;
+        if (response.status === 417) throw new RestError(503, "Grok Bot cloud computer is asleep and could not be woken. Re-export with --include-backend; opening the desktop app is the fallback", "desktop_asleep");
+        throw new RestError(response.status === 401 || response.status === 403 ? 503 : response.status === 429 ? 429 : 502,
+          `Grok Bot gateway returned HTTP ${response.status}; re-export the desktop session if expired`, "desktop_gateway_error");
+      }
+      const chunks = [];
+      let size = 0;
+      for await (const chunk of response.body ?? []) {
+        size += chunk.length;
+        if (size > 4 * 1024 * 1024) throw new RestError(502, "Desktop gateway response exceeds 4 MiB", "upstream_error");
+        chunks.push(Buffer.from(chunk));
+      }
+      try {
+        const result = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        verifiedSession = fingerprint(descriptor);
+        verifiedAt = new Date().toISOString();
+        return result;
+      }
+      catch { throw new RestError(502, "Desktop gateway returned invalid JSON", "upstream_error"); }
     }
-    headers["Content-Type"] = "application/json";
-    headers.Authorization = `Bearer ${descriptor.gatewayToken}`;
-    const response = await fetch(`${descriptor.gatewayUrl.replace(/\/+$/, "")}/api/${method}`, {
-      method: "POST", headers, body: JSON.stringify(body), redirect: "error",
-      signal: AbortSignal.timeout(config.grokBot?.requestTimeoutMs ?? 30000),
-    });
-    if (!response.ok) {
-      await response.body?.cancel();
-      if (response.status === 417) throw new RestError(503, "Grok Bot cloud computer is asleep. Open the desktop app to wake it; re-export the session if its gateway changed", "desktop_asleep");
-      throw new RestError(response.status === 401 || response.status === 403 ? 503 : response.status === 429 ? 429 : 502,
-        `Grok Bot gateway returned HTTP ${response.status}; re-export the desktop session if expired`, "desktop_gateway_error");
-    }
-    const chunks = [];
-    let size = 0;
-    for await (const chunk of response.body ?? []) {
-      size += chunk.length;
-      if (size > 4 * 1024 * 1024) throw new RestError(502, "Desktop gateway response exceeds 4 MiB", "upstream_error");
-      chunks.push(Buffer.from(chunk));
-    }
-    try {
-      const result = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-      verifiedSession = fingerprint(descriptor);
-      verifiedAt = new Date().toISOString();
-      return result;
-    }
-    catch { throw new RestError(502, "Desktop gateway returned invalid JSON", "upstream_error"); }
   }
 
   const desktop = new DesktopJobs(config.grokBot ?? {}, botCall);

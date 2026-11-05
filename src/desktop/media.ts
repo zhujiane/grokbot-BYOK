@@ -32,6 +32,32 @@ type StoreRead = { url: string; expires_at: number; size: number; mime: string }
 export class DesktopMedia {
   private cache = new Map<string, StoreRead>();
   constructor(private session: () => Promise<BackendSession | undefined>, private fetcher: typeof fetch = fetch) {}
+  private accountHeaders(session: BackendSession, namespace = "sand") {
+    const headers: Record<string, string> = {
+      Authorization: `Bearer ${session.accessToken}`, "Content-Type": "application/json", "Connect-Protocol-Version": "1",
+      "x-cursor-client-type": "sand", "x-cursor-client-version": session.clientVersion,
+      "x-sand-box-namespace": namespace, "x-cursor-client-os": "win32", "x-ghost-mode": "true",
+    };
+    if (session.machineId) headers["x-cursor-checksum"] = checksum(session.machineId);
+    if (session.teamId) headers["x-cursor-team-id"] = String(session.teamId);
+    return headers;
+  }
+  /** Wake a hibernated cloud computer through the desktop account backend. Returns false when unavailable. */
+  async wake(): Promise<boolean> {
+    const session = await this.session();
+    if (!session) return false;
+    const base = new URL(session.baseUrl);
+    if (base.hostname !== "api2.cursor.sh" && base.hostname !== "api.origin.cursor.com") return false;
+    try {
+      const res = await this.fetcher(`${base.origin}/aiserver.v1.GrokBotService/EnsureSandBox`, {
+        method: "POST", headers: this.accountHeaders(session, "prod"),
+        body: JSON.stringify({ wake: true, supportsAsleepBox: true }),
+        redirect: "error", signal: AbortSignal.timeout(120000),
+      });
+      await res.body?.cancel();
+      return res.ok;
+    } catch { return false; }
+  }
   async resolve(path: string, agentId?: string, fresh = false): Promise<StoreRead | undefined> {
     const alias = attachmentAlias(path, agentId);
     if (!alias) return;
@@ -45,13 +71,7 @@ export class DesktopMedia {
     const key = createHash("sha256").update(session.accessToken).digest("hex") + alias.path;
     const cached = this.cache.get(key);
     if (!fresh && cached && cached.expires_at * 1000 > Date.now() + 60000) return cached;
-    const headers: Record<string, string> = {
-      Authorization: `Bearer ${session.accessToken}`, "Content-Type": "application/json", "Connect-Protocol-Version": "1",
-      "x-cursor-client-type": "sand", "x-cursor-client-version": session.clientVersion,
-      "x-sand-box-namespace": "sand", "x-cursor-client-os": "win32", "x-ghost-mode": "true",
-    };
-    if (session.machineId) headers["x-cursor-checksum"] = checksum(session.machineId);
-    if (session.teamId) headers["x-cursor-team-id"] = String(session.teamId);
+    const headers = this.accountHeaders(session);
     const res = await this.fetcher(`${base.origin}/aiserver.v1.GrokBotService/ResolveGrokBotAttachmentReads`, {
       method: "POST", headers, body: JSON.stringify({ agentId: alias.agentId, paths: [alias.path] }),
       redirect: "error", signal: AbortSignal.timeout(15000),

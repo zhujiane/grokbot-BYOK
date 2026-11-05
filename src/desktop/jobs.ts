@@ -157,8 +157,15 @@ export class DesktopJobs {
         created_at: Math.floor(Date.now() / 1000), phase: "creating", status: "queued", clientNonce: randomUUID() };
       await this.save(job);
       // A submission is never replayed automatically, including after restart.
-      const work = this.submit(job, images).catch(async () => {
-        this.fail(job, "submission_uncertain", "Submission was interrupted and may have reached the Bot. Inspect agent_id before starting another job.");
+      const work = this.submit(job, images).catch(async (error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        const code = (error as { code?: unknown })?.code;
+        // Only a failure at/after sendPrompt can have reached the Bot; earlier phases never did.
+        if (job.phase === "sending" || job.phase === "submitted") {
+          this.fail(job, "submission_uncertain", `Submission was interrupted after sendPrompt started: ${message}. Inspect agent_id before starting another job.`);
+        } else {
+          this.fail(job, typeof code === "string" && code ? code : "submission_failed", `Submission failed before sendPrompt; safe to retry. ${message}`);
+        }
         await this.save(job);
       }).catch(() => { /* A storage failure must not cause an unhandled worker rejection. */ })
         .finally(() => this.active.delete(job.id));
@@ -180,6 +187,7 @@ export class DesktopJobs {
     job.phase = "uploading";
     await this.save(job);
     const attachments: string[] = [];
+    const attachmentNames: string[] = [];
     const instructions: string[] = [];
     let imageIndex = 0;
     const prepareImage = async (image: string): Promise<string> => {
@@ -190,10 +198,13 @@ export class DesktopJobs {
         return local;
       }
       const match = /^data:image\/(png|jpeg|webp);base64,(.+)$/.exec(image)!;
+      const filename = `${index === 0 ? "reference" : `reference-${index}`}.${match[1] === "jpeg" ? "jpg" : match[1]}`;
       const uploaded = z.object({ path: z.string().min(1) }).parse(await this.call("uploadAttachment", {
-        agentId: agent.id, filename: `${index === 0 ? "reference" : `reference-${index}`}.${match[1] === "jpeg" ? "jpg" : match[1]}`, bytesBase64: match[2],
+        agentId: agent.id, filename, bytesBase64: match[2],
       }));
       attachments.push(uploaded.path);
+      // The gateway requires one display name per attachment path, aligned by index (HTTP 409 otherwise).
+      attachmentNames.push(filename);
       return uploaded.path;
     };
     const imageParameters: Record<string, unknown> = {};
@@ -225,7 +236,7 @@ export class DesktopJobs {
     job.phase = "sending";
     await this.save(job);
     const receipt = await this.call("sendPrompt", { agentId: agent.id, prompt, clientNonce: job.clientNonce,
-      ...(attachments.length ? { attachmentPaths: attachments } : {}) });
+      ...(attachments.length ? { attachmentPaths: attachments, attachmentNames } : {}) });
     job.delivery = receipt?.accepted === true ? "accepted" : "unknown";
     job.phase = "submitted";
     job.status = "in_progress";

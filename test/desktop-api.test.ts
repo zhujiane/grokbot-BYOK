@@ -43,6 +43,9 @@ async function setup() {
       bots.set(id, { entries: [] }); reply = { agent: { id }, transcript: [] };
     }
     if (method === "sendPrompt") {
+      if (body.attachmentPaths && (!Array.isArray(body.attachmentNames) || body.attachmentNames.length !== body.attachmentPaths.length)) {
+        res.writeHead(409, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "attachment_names must align with attachment_paths." })); return;
+      }
       Object.assign(bots.get(body.agentId)!, { nonce: body.clientNonce, prompt: body.prompt }); reply = { accepted: true };
     }
     if (method === "getAgentTranscriptTail") reply = { entries: bots.get(body.id)?.entries ?? [] };
